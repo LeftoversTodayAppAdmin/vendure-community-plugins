@@ -392,7 +392,7 @@ describe('PunchOut Gateway Plugin', () => {
     });
 
     describe('Shipping Cost Modes', () => {
-        it('should omit shipping when shippingCostMode is none', async () => {
+        it('should include non-zero shipping in nonZero mode', async () => {
             // This test uses the plugin configured with 'nonZero', so shipping (5.00) IS included.
             // To test 'none' mode we'd need a separate plugin instance.
             // For now, verify the nonZero mode correctly includes non-zero shipping.

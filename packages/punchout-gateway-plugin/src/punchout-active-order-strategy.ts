@@ -9,6 +9,8 @@ import {
 import { DocumentNode } from 'graphql';
 import gql from 'graphql-tag';
 
+import { PUNCHOUT_STRATEGY_NAME } from './constants';
+
 export interface PunchOutActiveOrderInput {
     sID: string;
 }
@@ -23,7 +25,7 @@ export interface PunchOutActiveOrderInput {
  * on all order-related Shop API operations (addItemToOrder, etc.).
  */
 export class PunchOutActiveOrderStrategy implements ActiveOrderStrategy<PunchOutActiveOrderInput> {
-    readonly name = 'punchout';
+    readonly name = PUNCHOUT_STRATEGY_NAME;
 
     private connection: TransactionalConnection;
     private orderService: OrderService;
@@ -61,6 +63,11 @@ export class PunchOutActiveOrderStrategy implements ActiveOrderStrategy<PunchOut
         const order = await qb.getOne();
         if (order) {
             return order;
+        }
+        // Only create an order for authenticated users to prevent
+        // unauthenticated requests from spamming order creation.
+        if (!ctx.activeUserId) {
+            return undefined;
         }
         // Create the order eagerly so that read-only queries (activeOrder)
         // never fall through to the DefaultActiveOrderStrategy, which would

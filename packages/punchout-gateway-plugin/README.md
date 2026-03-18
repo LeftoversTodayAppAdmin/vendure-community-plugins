@@ -56,7 +56,9 @@ PunchCommerce will redirect buyers to your Entry address with `?sID={UUID}&uID={
 
 ## Storefront Requirements
 
-Since Vendure is headless, your storefront must handle the PunchOut flow. Here's what needs to be implemented:
+Since Vendure is headless, your storefront must handle the PunchOut flow. A full working example is available at [vendurehq/punchcommerce-storefront-demo](https://github.com/vendurehq/punchcommerce-storefront-demo).
+
+Here's what needs to be implemented:
 
 ### 1. PunchOut Landing Page
 

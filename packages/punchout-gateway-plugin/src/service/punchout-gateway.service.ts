@@ -1,11 +1,9 @@
 import { Inject, Injectable } from '@nestjs/common';
 import {
-    ActiveOrderService,
     idsAreEqual,
     isGraphQlErrorResult,
     Logger,
     Order,
-    OrderLine,
     OrderService,
     RequestContext,
     TransactionalConnection,
@@ -37,7 +35,6 @@ export class PunchOutGatewayService {
 
     constructor(
         @Inject(PUNCHOUT_GATEWAY_PLUGIN_OPTIONS) private options: PunchOutGatewayPluginOptions,
-        private activeOrderService: ActiveOrderService,
         private orderService: OrderService,
         private connection: TransactionalConnection,
     ) {
