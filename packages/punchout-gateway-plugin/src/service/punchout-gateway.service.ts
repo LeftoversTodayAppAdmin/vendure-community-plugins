@@ -4,6 +4,7 @@ import {
     isGraphQlErrorResult,
     Logger,
     Order,
+    OrderLine,
     OrderService,
     RequestContext,
     TransactionalConnection,
