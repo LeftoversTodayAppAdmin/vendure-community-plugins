@@ -59,7 +59,7 @@ export class PunchOutActiveOrderStrategy implements ActiveOrderStrategy<PunchOut
             qb.andWhere('user.id = :userId', { userId: ctx.activeUserId });
         }
         const order = await qb.getOne();
-        return order || undefined;
+        return order ?? undefined;
     }
 
     async createActiveOrder(ctx: RequestContext, input: PunchOutActiveOrderInput): Promise<Order> {

@@ -182,6 +182,21 @@ The plugin maps Vendure order lines to PunchCommerce basket positions:
 - **Product descriptions**: `description` is plain text (HTML stripped), `description_long` preserves HTML
 - **Basket** is sent as `multipart/form-data` to PunchCommerce's `/gateway/v3/return` endpoint
 
+## Order Lifecycle
+
+After a successful cart transfer, the order transitions to a custom **`Transferred`** state:
+
+```
+AddingItems → Transferred
+```
+
+- The order becomes **inactive** (`active = false`), so a new PunchOut session creates a fresh cart
+- The order and all its line items are **preserved** in Vendure for record-keeping
+- The order is visible in the Vendure admin under Orders with state `Transferred`
+- Re-transferring the same session returns an error since no active order exists
+
+The actual purchase order (PO) comes later through a separate channel — either manually or via cXML order transmission (future scope). The `Transferred` state represents "cart handed off to procurement system, awaiting PO."
+
 ## Parallel Sessions
 
 The plugin uses a custom `ActiveOrderStrategy` to scope orders by PunchOut session ID (`sID`). This means:

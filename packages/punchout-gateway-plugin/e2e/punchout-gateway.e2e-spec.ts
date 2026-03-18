@@ -25,17 +25,24 @@ import {
 
 /**
  * Extracts the JSON basket from a nock-captured body.
- * Nock may pass URL-encoded body as a parsed object or string.
+ * Handles multipart/form-data (string with boundaries), URL-encoded (parsed object), or raw string.
  */
 function parseBasketFromBody(body: any): any {
     if (typeof body === 'object' && body.basket) {
-        // nock parsed the URL-encoded body into { basket: "..." }
         return typeof body.basket === 'string' ? JSON.parse(body.basket) : body.basket;
     }
     if (typeof body === 'string') {
+        // Try multipart: extract JSON between form-data boundaries
+        const match = body.match(/name="basket"\r?\n\r?\n([\s\S]*?)\r?\n--/);
+        if (match?.[1]) {
+            return JSON.parse(match[1]);
+        }
+        // Try URL-encoded
         const params = new URLSearchParams(body);
         const basketStr = params.get('basket');
-        return basketStr ? JSON.parse(basketStr) : undefined;
+        if (basketStr) {
+            return JSON.parse(basketStr);
+        }
     }
     return undefined;
 }
@@ -154,7 +161,7 @@ describe('PunchOut Gateway Plugin', () => {
     });
 
     describe('Cart Transfer', () => {
-        it('should fail transfer when not authenticated', async () => {
+        it('should fail transfer when no active order exists for session', async () => {
             const { transferPunchOutCart } = await shopClient.query(TRANSFER_PUNCHOUT_CART, {
                 sID: mockSID,
             });

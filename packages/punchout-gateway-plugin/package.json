@@ -29,6 +29,7 @@
         "@vendure/common": ">=3.0.0"
     },
     "dependencies": {
+        "form-data": "^4.0.0",
         "graphql-tag": "^2.12.6",
         "node-fetch": "^2.7.0"
     },

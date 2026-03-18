@@ -10,6 +10,7 @@ import {
     RequestContext,
     TransactionalConnection,
 } from '@vendure/core';
+import FormData from 'form-data';
 import fetch from 'node-fetch';
 
 import {
@@ -89,11 +90,12 @@ export class PunchOutGatewayService {
         Logger.debug(`Basket payload: ${JSON.stringify(basket, null, 2)}`, loggerCtx);
 
         try {
-            const params = new URLSearchParams();
-            params.append('basket', JSON.stringify(basket));
+            const formData = new FormData();
+            formData.append('basket', JSON.stringify(basket));
             const response = await fetch(url, {
                 method: 'POST',
-                body: params,
+                body: formData,
+                headers: formData.getHeaders(),
             });
             if (!response.ok) {
                 const body = await response.text().catch(() => '');
@@ -173,7 +175,7 @@ export class PunchOutGatewayService {
         const product = variant.product;
         const productTranslation = this.getTranslation(product?.translations, languageCode);
         const productDescription = this.stripHtml(productTranslation?.description ?? '');
-        // description = plain text for OCI protocol (max ~39 chars), description_long = full HTML
+        // description = plain text (HTML stripped), description_long = original HTML (PunchCommerce may truncate per OCI spec)
         const descriptionLong = productTranslation?.description ?? '';
         const sku = variant.sku;
         const currency = ctx.channel.defaultCurrencyCode;
