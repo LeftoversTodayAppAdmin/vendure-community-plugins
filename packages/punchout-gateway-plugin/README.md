@@ -37,6 +37,38 @@ export const config: VendureConfig = {
 | --- | --- | --- | --- |
 | `apiUrl` | No | `https://www.punchcommerce.de` | Base URL of the PunchCommerce gateway. Override for staging or self-hosted instances. |
 | `shippingCostMode` | No | `'nonZero'` | Controls shipping line item in the basket: `'all'` = always include, `'nonZero'` = only when > 0, `'none'` = never include. |
+| `productFieldMapping` | No | — | Maps PunchCommerce product fields to static values or ProductVariant custom field names. See below. |
+
+### Product Field Mapping
+
+By default, all products are sent as pieces (`unit: 'PCE'`). If your catalog includes products with different units (weight, volume, etc.), you can map PunchCommerce fields to ProductVariant custom fields or static values.
+
+Each field accepts either a static value or a `{ customField, default }` object that reads from the variant at transfer time:
+
+```ts
+PunchOutGatewayPlugin.init({
+    productFieldMapping: {
+        // Static value for all products
+        packaging_unit: 'Bag',
+
+        // Read from ProductVariant custom field, fall back to 'PCE' if empty
+        unit: { customField: 'punchOutUnit', default: 'PCE' },
+        unit_name: { customField: 'punchOutUnitName', default: 'Piece' },
+        weight: { customField: 'productWeight', default: 0 },
+    },
+})
+```
+
+Available fields:
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `unit` | `'PCE'` | OCI unit code (e.g. `'PCE'`, `'KG'`, `'LTR'`) |
+| `unit_name` | `'Piece'` | Human-readable unit name |
+| `packaging_unit` | `'Piece'` | Packaging unit description |
+| `purchase_unit` | `1` | Purchase unit quantity |
+| `reference_unit` | `1` | Reference unit quantity |
+| `weight` | `0` | Product weight |
 
 ## Customer Setup
 

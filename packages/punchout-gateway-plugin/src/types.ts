@@ -1,3 +1,35 @@
+/**
+ * Maps a PunchCommerce product field to either a static value or a
+ * ProductVariant custom field name. When a custom field is specified,
+ * the value is read from the variant at transfer time, falling back
+ * to `default` when the field is empty or missing.
+ *
+ * @example
+ * // Static value
+ * unit: 'KG'
+ *
+ * // Custom field with fallback
+ * unit: { customField: 'punchOutUnit', default: 'PCE' }
+ */
+export type ProductFieldMapping<T extends string | number = string> =
+    | T
+    | { customField: string; default: T };
+
+export interface ProductFieldMappings {
+    /** OCI unit code (e.g. 'PCE', 'KG', 'LTR'). @default 'PCE' */
+    unit?: ProductFieldMapping;
+    /** Human-readable unit name. @default 'Piece' */
+    unit_name?: ProductFieldMapping;
+    /** Packaging unit description. @default 'Piece' */
+    packaging_unit?: ProductFieldMapping;
+    /** Purchase unit quantity. @default 1 */
+    purchase_unit?: ProductFieldMapping<number>;
+    /** Reference unit quantity. @default 1 */
+    reference_unit?: ProductFieldMapping<number>;
+    /** Product weight. @default 0 */
+    weight?: ProductFieldMapping<number>;
+}
+
 export interface PunchOutGatewayPluginOptions {
     /**
      * Base URL of the PunchCommerce gateway API.
@@ -17,6 +49,19 @@ export interface PunchOutGatewayPluginOptions {
      * @default 'nonZero'
      */
     shippingCostMode?: 'all' | 'nonZero' | 'none';
+    /**
+     * Maps PunchCommerce product fields to static values or
+     * ProductVariant custom field names. Unspecified fields use
+     * Vendure's default piece-based units.
+     *
+     * @example
+     * productFieldMapping: {
+     *     unit: { customField: 'punchOutUnit', default: 'PCE' },
+     *     unit_name: { customField: 'punchOutUnitName', default: 'Piece' },
+     *     weight: { customField: 'productWeight', default: 0 },
+     * }
+     */
+    productFieldMapping?: ProductFieldMappings;
 }
 
 declare module '@vendure/core/dist/entity/custom-entity-fields' {

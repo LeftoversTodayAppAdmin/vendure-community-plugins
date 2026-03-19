@@ -19,6 +19,7 @@ import {
     TRANSFERRED_ORDER_STATE,
 } from '../constants';
 import {
+    ProductFieldMapping,
     PunchCommerceBasket,
     PunchCommercePosition,
     PunchCommerceProduct,
@@ -128,6 +129,24 @@ export class PunchOutGatewayService {
         return cents / 100;
     }
 
+    private resolveField<T extends string | number>(
+        mapping: ProductFieldMapping<T> | undefined,
+        variant: { customFields?: Record<string, any> },
+        fallback: T,
+    ): T {
+        if (mapping == null) {
+            return fallback;
+        }
+        if (typeof mapping === 'string' || typeof mapping === 'number') {
+            return mapping;
+        }
+        const value = variant.customFields?.[mapping.customField];
+        if (value != null && value !== '') {
+            return value as T;
+        }
+        return mapping.default ?? fallback;
+    }
+
     private getTranslation<T extends { languageCode: string }>(
         translations: T[] | undefined,
         languageCode: string,
@@ -167,6 +186,7 @@ export class PunchOutGatewayService {
     }
 
     private transformOrderLine(ctx: RequestContext, line: OrderLine): PunchCommercePosition {
+        const mapping = this.options.productFieldMapping;
         const variant = line.productVariant;
         const languageCode = ctx.languageCode;
         const variantName = this.getTranslation(variant.translations, languageCode)?.name ?? '';
@@ -201,13 +221,12 @@ export class PunchOutGatewayService {
                 price: this.centsToDecimal(line.unitPrice),
                 currency,
                 tax_rate: line.taxRate,
-                // PunchCommerce requires these fields even when not applicable
-                purchase_unit: 1,
-                reference_unit: 1,
-                unit: 'PCE',
-                unit_name: 'Piece',
-                packaging_unit: 'Piece',
-                weight: 0,
+                purchase_unit: this.resolveField(mapping?.purchase_unit, variant, 1),
+                reference_unit: this.resolveField(mapping?.reference_unit, variant, 1),
+                unit: this.resolveField(mapping?.unit, variant, 'PCE'),
+                unit_name: this.resolveField(mapping?.unit_name, variant, 'Piece'),
+                packaging_unit: this.resolveField(mapping?.packaging_unit, variant, 'Piece'),
+                weight: this.resolveField(mapping?.weight, variant, 0),
                 shipping_time: 0,
                 active: true,
             },

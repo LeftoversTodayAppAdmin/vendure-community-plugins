@@ -100,6 +100,11 @@ describe('PunchOut Gateway Plugin', () => {
                     shippingCostMode: 'nonZero',
                 }),
             ],
+            customFields: {
+                ProductVariant: [
+                    { name: 'punchOutUnit', type: 'string', nullable: true, public: false },
+                ],
+            },
         });
         const env = createTestEnvironment(devConfig);
         shopClient = env.shopClient;
@@ -492,6 +497,118 @@ describe('PunchOut Gateway Plugin', () => {
             const shipping = basket.basket.find((p: any) => p.type === 'shipping-costs');
             expect(shipping).toBeDefined();
             expect(shipping.price).toBe(5);
+        });
+    });
+
+    describe('Product Field Mapping', () => {
+        afterEach(() => {
+            PunchOutGatewayPlugin.options.productFieldMapping = undefined;
+        });
+
+        it('should use default unit values when no mapping is configured', async () => {
+            const sID = 'field-mapping-defaults';
+            await setupPunchOutOrder(shopClient, sID, mockUID);
+
+            let capturedBody: any;
+            nock(mockApiUrl)
+                .post('/gateway/v3/return', (body: any) => { capturedBody = body; return true; })
+                .query({ sID })
+                .reply(200);
+
+            await shopClient.query(TRANSFER_PUNCHOUT_CART, { sID });
+
+            const basket = parseBasketFromBody(capturedBody);
+            const product = basket.basket.find((p: any) => p.type === 'product')?.product;
+            expect(product.unit).toBe('PCE');
+            expect(product.unit_name).toBe('Piece');
+            expect(product.packaging_unit).toBe('Piece');
+            expect(product.purchase_unit).toBe(1);
+            expect(product.reference_unit).toBe(1);
+            expect(product.weight).toBe(0);
+        });
+
+        it('should use static values from productFieldMapping', async () => {
+            PunchOutGatewayPlugin.options.productFieldMapping = {
+                unit: 'KG',
+                unit_name: 'Kilogram',
+                packaging_unit: 'Bag',
+                weight: 5,
+            };
+            const sID = 'field-mapping-static';
+            await setupPunchOutOrder(shopClient, sID, mockUID);
+
+            let capturedBody: any;
+            nock(mockApiUrl)
+                .post('/gateway/v3/return', (body: any) => { capturedBody = body; return true; })
+                .query({ sID })
+                .reply(200);
+
+            await shopClient.query(TRANSFER_PUNCHOUT_CART, { sID });
+
+            const basket = parseBasketFromBody(capturedBody);
+            const product = basket.basket.find((p: any) => p.type === 'product')?.product;
+            expect(product.unit).toBe('KG');
+            expect(product.unit_name).toBe('Kilogram');
+            expect(product.packaging_unit).toBe('Bag');
+            expect(product.weight).toBe(5);
+        });
+
+        it('should read unit from ProductVariant custom field', async () => {
+            // Set custom field on variant T_1
+            await adminClient.query(gql`
+                mutation UpdateVariant($input: [UpdateProductVariantInput!]!) {
+                    updateProductVariants(input: $input) {
+                        ... on ProductVariant { id }
+                    }
+                }
+            `, { input: [{ id: 'T_1', customFields: { punchOutUnit: 'KG' } }] });
+
+            PunchOutGatewayPlugin.options.productFieldMapping = {
+                unit: { customField: 'punchOutUnit', default: 'PCE' },
+            };
+            const sID = 'field-mapping-custom-field';
+            await setupPunchOutOrder(shopClient, sID, mockUID);
+
+            let capturedBody: any;
+            nock(mockApiUrl)
+                .post('/gateway/v3/return', (body: any) => { capturedBody = body; return true; })
+                .query({ sID })
+                .reply(200);
+
+            await shopClient.query(TRANSFER_PUNCHOUT_CART, { sID });
+
+            const basket = parseBasketFromBody(capturedBody);
+            const product = basket.basket.find((p: any) => p.type === 'product')?.product;
+            expect(product.unit).toBe('KG');
+
+            // Reset custom field
+            await adminClient.query(gql`
+                mutation UpdateVariant($input: [UpdateProductVariantInput!]!) {
+                    updateProductVariants(input: $input) {
+                        ... on ProductVariant { id }
+                    }
+                }
+            `, { input: [{ id: 'T_1', customFields: { punchOutUnit: null } }] });
+        });
+
+        it('should fall back to default when custom field is not set on variant', async () => {
+            PunchOutGatewayPlugin.options.productFieldMapping = {
+                unit: { customField: 'nonExistentField', default: 'LTR' },
+            };
+            const sID = 'field-mapping-fallback';
+            await setupPunchOutOrder(shopClient, sID, mockUID);
+
+            let capturedBody: any;
+            nock(mockApiUrl)
+                .post('/gateway/v3/return', (body: any) => { capturedBody = body; return true; })
+                .query({ sID })
+                .reply(200);
+
+            await shopClient.query(TRANSFER_PUNCHOUT_CART, { sID });
+
+            const basket = parseBasketFromBody(capturedBody);
+            const product = basket.basket.find((p: any) => p.type === 'product')?.product;
+            expect(product.unit).toBe('LTR');
         });
     });
 });
