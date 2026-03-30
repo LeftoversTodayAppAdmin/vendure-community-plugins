@@ -32,6 +32,7 @@ clearAllTables(populateConfig, true)
                     return app;
                 }),
             initialData,
+            path.join(__dirname, '../packages/punchout-gateway-plugin/e2e/fixtures/e2e-products-minimal.csv'),
         ),
     )
     .then(async app => {

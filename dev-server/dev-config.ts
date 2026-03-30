@@ -22,6 +22,7 @@ import { DataSourceOptions } from 'typeorm';
 // import { SentryPlugin } from '../packages/sentry-plugin/src/sentry-plugin';
 // import { StellatePlugin } from '../packages/stellate-plugin/src/stellate-plugin';
 // import { PubSubPlugin } from '../packages/pub-sub-plugin/src/plugin';
+// import { PunchOutGatewayPlugin } from '../packages/punchout-gateway-plugin/src/punchout-gateway-plugin';
 
 /**
  * Dev server config for testing community plugins during development.
@@ -87,6 +88,8 @@ export const devConfig: VendureConfig = {
         // SentryPlugin.init({
         //     includeErrorTestMutation: true,
         // }),
+
+        // PunchOutGatewayPlugin.init({}),
     ],
 };
 
