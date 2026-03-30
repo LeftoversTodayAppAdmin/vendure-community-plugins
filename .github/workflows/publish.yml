@@ -27,6 +27,7 @@ on:
                     - braintree-plugin
                     - elasticsearch-plugin
                     - mollie-plugin
+                    - punchout-gateway-plugin
                     - sentry-plugin
                     - stellate-plugin
                     - stripe-plugin
@@ -55,6 +56,14 @@ jobs:
                     echo "publish_type=${{ inputs.publish_type }}" >> $GITHUB_OUTPUT
                   fi
 
+            - name: Validate inputs
+              if: github.event_name == 'workflow_dispatch'
+              run: |
+                  if [ "${{ inputs.publish_type }}" == "release" ] && [ "${{ inputs.package }}" != "all" ] && [ "${{ inputs.package }}" != "" ]; then
+                    echo "::error::Release publishes must use 'all' packages. Per-package selection is only for nightly builds."
+                    exit 1
+                  fi
+
     publish:
         needs: setup
         runs-on: ubuntu-latest
@@ -67,13 +76,14 @@ jobs:
               with:
                   fetch-depth: 0
 
-            # For nightly builds: check if there were commits in the last 24 hours
+            # For nightly builds: check if there were commits in the last 25 hours
+            # (25h instead of 24h to account for cron schedule jitter)
             - name: Check for new commits
               id: commit_check
               if: needs.setup.outputs.publish_type == 'nightly'
               run: |
-                  COMMITS=$(git rev-list --count --since="24 hours" HEAD)
-                  echo "Commits found in last 24h: $COMMITS"
+                  COMMITS=$(git rev-list --count --since="25 hours" HEAD)
+                  echo "Commits found in last 25h: $COMMITS"
                   if [ "$COMMITS" -eq 0 ]; then
                     echo "should_publish=false" >> $GITHUB_OUTPUT
                   else
@@ -82,7 +92,7 @@ jobs:
 
             - name: Skip publish (no new commits)
               if: needs.setup.outputs.publish_type == 'nightly' && steps.commit_check.outputs.should_publish == 'false'
-              run: echo "No new commits in last 24 hours – skipping nightly publish."
+              run: echo "No new commits in last 25 hours – skipping nightly publish."
 
             - name: Setup Node.js
               if: needs.setup.outputs.publish_type == 'release' || steps.commit_check.outputs.should_publish == 'true'
@@ -93,17 +103,19 @@ jobs:
 
             - name: Update npm
               if: needs.setup.outputs.publish_type == 'release' || steps.commit_check.outputs.should_publish == 'true'
-              run: npm install -g npm@latest
+              run: npm install -g npm@11
 
             - name: Install dependencies
               if: needs.setup.outputs.publish_type == 'release' || steps.commit_check.outputs.should_publish == 'true'
-              run: npm install --no-save
+              run: npm ci
 
             - name: Build
               if: needs.setup.outputs.publish_type == 'release' || steps.commit_check.outputs.should_publish == 'true'
               run: npm run build
 
-            # Nightly builds: configure git and bump to pre-release versions
+            # Nightly builds: configure git and bump to pre-release versions.
+            # The version bump is committed (but never pushed) so that npm provenance
+            # attestation links to a commit whose package.json matches the published version.
             - name: Configure Git
               if: needs.setup.outputs.publish_type == 'nightly' && steps.commit_check.outputs.should_publish == 'true'
               run: |
@@ -130,12 +142,14 @@ jobs:
             - name: Commit version changes
               if: needs.setup.outputs.publish_type == 'nightly' && steps.commit_check.outputs.should_publish == 'true'
               run: |
-                  git add .
+                  git add packages/*/package.json
                   git commit -m "chore: Bump version for nightly pre-release"
 
-            # Publish to npm
+            # Publish to npm with provenance attestation.
             # Note: we do not use `lerna publish` because it fails with Trusted Publishing.
             # We use `lerna exec` with `npm publish` directly instead.
+            # --access public is also set in each package's publishConfig but kept here
+            # as a safety net for first-time scoped package publishes.
             - name: Publish to NPM (release)
               if: needs.setup.outputs.publish_type == 'release'
               run: |
