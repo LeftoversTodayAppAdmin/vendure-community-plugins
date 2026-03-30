@@ -15,12 +15,12 @@ import { BraintreePluginOptions } from './types';
  * 1. You will need to create a Braintree sandbox account as outlined in https://developers.braintreepayments.com/start/overview.
  * 2. Then install `braintree` and `@types/braintree` from npm. This plugin was written with `v3.x` of the Braintree lib.
  *     ```shell
- *     yarn add \@vendure/payments-plugin braintree
+ *     yarn add \@vendure-community/braintree-plugin braintree
  *     yarn add -D \@types/braintree
  *     ```
  *     or
  *     ```shell
- *     npm install \@vendure/payments-plugin braintree
+ *     npm install \@vendure-community/braintree-plugin braintree
  *     npm install -D \@types/braintree
  *     ```
  *
@@ -28,7 +28,7 @@ import { BraintreePluginOptions } from './types';
  *
  * 1. Add the plugin to your VendureConfig `plugins` array:
  *     ```ts
- *     import { BraintreePlugin } from '\@vendure/payments-plugin/package/braintree';
+ *     import { BraintreePlugin } from '\@vendure-community/braintree-plugin';
  *     import { Environment } from 'braintree';
  *
  *     // ...

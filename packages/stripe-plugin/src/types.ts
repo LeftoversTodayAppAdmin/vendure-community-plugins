@@ -45,7 +45,7 @@ export interface StripePluginOptions {
      * @example
      * ```ts
      * import { EntityHydrator, VendureConfig } from '\@vendure/core';
-     * import { StripePlugin } from '\@vendure/payments-plugin/package/stripe';
+     * import { StripePlugin } from '\@vendure-community/stripe-plugin';
      *
      * export const config: VendureConfig = {
      *   // ...
@@ -84,7 +84,7 @@ export interface StripePluginOptions {
      * @example
      * ```ts
      * import { VendureConfig } from '\@vendure/core';
-     * import { StripePlugin } from '\@vendure/payments-plugin/package/stripe';
+     * import { StripePlugin } from '\@vendure-community/stripe-plugin';
      *
      * export const config: VendureConfig = {
      *   // ...
@@ -119,7 +119,7 @@ export interface StripePluginOptions {
      * @example
      * ```ts
      * import { VendureConfig } from '\@vendure/core';
-     * import { StripePlugin } from '\@vendure/payments-plugin/package/stripe';
+     * import { StripePlugin } from '\@vendure-community/stripe-plugin';
      *
      * export const config: VendureConfig = {
      *   // ...
@@ -154,7 +154,7 @@ export interface StripePluginOptions {
      * @example
      * ```ts
      * import { EntityHydrator, VendureConfig } from '\@vendure/core';
-     * import { StripePlugin } from '\@vendure/payments-plugin/package/stripe';
+     * import { StripePlugin } from '\@vendure-community/stripe-plugin';
      *
      * export const config: VendureConfig = {
      *   // ...

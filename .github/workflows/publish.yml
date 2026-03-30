@@ -9,10 +9,12 @@ on:
                 type: choice
                 options:
                     - all
+                    - braintree-plugin
                     - elasticsearch-plugin
-                    - payments-plugin
+                    - mollie-plugin
                     - sentry-plugin
                     - stellate-plugin
+                    - stripe-plugin
                     - pub-sub-plugin
             dist-tag:
                 description: 'npm dist-tag'

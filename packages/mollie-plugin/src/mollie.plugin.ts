@@ -46,7 +46,7 @@ export interface MolliePluginOptions {
      * @example
      * ```ts
      * import { VendureConfig } from '\@vendure/core';
-     * import { MolliePlugin, getLocale } from '\@vendure/payments-plugin/package/mollie';
+     * import { MolliePlugin, getLocale } from '\@vendure-community/mollie-plugin';
      *
      * export const config: VendureConfig = {
      *   // ...
@@ -102,17 +102,17 @@ export interface MolliePluginOptions {
  * 1. You will need to create a Mollie account and get your api key from the Mollie dashboard.
  * 2. Install the Payments plugin and the Mollie client:
  *
- *     `yarn add \@vendure/payments-plugin \@mollie/api-client`
+ *     `yarn add \@vendure-community/mollie-plugin \@mollie/api-client`
  *
  *     or
  *
- *     `npm install \@vendure/payments-plugin \@mollie/api-client`
+ *     `npm install \@vendure-community/mollie-plugin \@mollie/api-client`
  *
  * ### Setup
  *
  * 1. Add the plugin to your VendureConfig `plugins` array:
  *     ```ts
- *     import { MolliePlugin } from '\@vendure/payments-plugin/package/mollie';
+ *     import { MolliePlugin } from '\@vendure-community/mollie-plugin';
  *
  *     // ...
  *
