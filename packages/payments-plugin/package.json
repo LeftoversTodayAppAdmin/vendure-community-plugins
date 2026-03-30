@@ -29,8 +29,8 @@
         "access": "public"
     },
     "peerDependencies": {
-        "@vendure/core": ">=3.0.0",
-        "@vendure/common": ">=3.0.0",
+        "@vendure/core": "3.6.0-minor-202603280303",
+        "@vendure/common": "3.6.0-minor-202603280303",
         "@mollie/api-client": "4.x",
         "braintree": "3.x",
         "stripe": "13.x"
@@ -53,9 +53,9 @@
         "@mollie/api-client": "^4.3.3",
         "@types/braintree": "^3.3.11",
         "@types/localtunnel": "2.0.4",
-        "@vendure/common": "^3.5.3",
-        "@vendure/core": "^3.5.3",
-        "@vendure/testing": "^3.5.3",
+        "@vendure/common": "3.6.0-minor-202603280303",
+        "@vendure/core": "3.6.0-minor-202603280303",
+        "@vendure/testing": "3.6.0-minor-202603280303",
         "braintree": "^3.22.0",
         "localtunnel": "2.0.2",
         "nock": "^13.1.4",
