@@ -1,21 +1,7 @@
 {
     "name": "@vendure-community/docs",
     "private": true,
-    "description": "Documentation for Vendure community plugins",
     "type": "module",
-    "main": "./src/index.ts",
-    "types": "./src/index.ts",
-    "exports": {
-        ".": {
-            "import": "./src/index.ts",
-            "require": "./src/index.ts"
-        },
-        "./manifest": {
-            "import": "./src/manifest.ts",
-            "require": "./src/manifest.ts"
-        }
-    },
-    "files": ["src", "docs"],
     "dependencies": {
         "@vendure-io/docs-provider": "^0.11.0"
     }
