@@ -51,6 +51,7 @@ jobs:
             publish_type: ${{ steps.determine.outputs.publish_type }}
             package_name: ${{ steps.parse_tag.outputs.package_name }}
             version: ${{ steps.parse_tag.outputs.version }}
+            dist_tag: ${{ steps.parse_tag.outputs.dist_tag }}
         steps:
             - name: Determine publish type
               id: determine
@@ -65,6 +66,7 @@ jobs:
 
             # For releases: parse the tag to get package name and version
             # Tag format: <package-name>/v<version> (e.g. elasticsearch-plugin/v1.1.0)
+            # Pre-release versions are supported (e.g. elasticsearch-plugin/v1.1.0-rc.1)
             - name: Parse release tag
               id: parse_tag
               if: github.event_name == 'release'
@@ -74,18 +76,20 @@ jobs:
                   VERSION="${TAG#*/v}"
                   echo "package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
                   echo "version=$VERSION" >> $GITHUB_OUTPUT
-                  echo "Releasing @vendure-community/$PACKAGE_NAME@$VERSION"
 
-                  # Validate tag format
-                  if [[ ! "$TAG" =~ ^[a-z-]+/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                    echo "::error::Invalid tag format '$TAG'. Expected '<package-name>/v<semver>' (e.g. elasticsearch-plugin/v1.1.0)"
+                  # Validate tag format (semver with optional pre-release suffix)
+                  if [[ ! "$TAG" =~ ^[a-z-]+/v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+                    echo "::error::Invalid tag format '$TAG'. Expected '<package-name>/v<semver>' (e.g. elasticsearch-plugin/v1.1.0 or elasticsearch-plugin/v1.1.0-rc.1)"
                     exit 1
                   fi
 
-                  # Validate package exists
-                  if [ ! -d "packages/$PACKAGE_NAME" ]; then
-                    echo "::error::Package directory 'packages/$PACKAGE_NAME' not found"
-                    exit 1
+                  # Determine npm dist-tag: pre-release versions get 'next', stable gets 'latest'
+                  if [[ "$VERSION" =~ - ]]; then
+                    echo "dist_tag=next" >> $GITHUB_OUTPUT
+                    echo "Releasing @vendure-community/$PACKAGE_NAME@$VERSION (pre-release → next tag)"
+                  else
+                    echo "dist_tag=latest" >> $GITHUB_OUTPUT
+                    echo "Releasing @vendure-community/$PACKAGE_NAME@$VERSION (stable → latest tag)"
                   fi
 
     publish:
@@ -151,11 +155,19 @@ jobs:
                   npm version ${{ needs.setup.outputs.version }} --no-git-tag-version
                   echo "Bumped to ${{ needs.setup.outputs.version }}"
 
+            - name: Validate package directory
+              if: needs.setup.outputs.publish_type == 'release'
+              run: |
+                  if [ ! -d "packages/${{ needs.setup.outputs.package_name }}" ]; then
+                    echo "::error::Package directory 'packages/${{ needs.setup.outputs.package_name }}' not found"
+                    exit 1
+                  fi
+
             - name: Publish to NPM (release)
               if: needs.setup.outputs.publish_type == 'release'
               run: |
                   cd packages/${{ needs.setup.outputs.package_name }}
-                  npm publish --access public --provenance
+                  npm publish --access public --provenance --tag ${{ needs.setup.outputs.dist_tag }}
 
             - name: Commit version bump
               if: needs.setup.outputs.publish_type == 'release'
