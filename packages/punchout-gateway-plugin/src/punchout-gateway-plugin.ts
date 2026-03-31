@@ -48,7 +48,7 @@ const PunchOutOptionsProvider = {
  * };
  * ```
  *
- * @docsCategory core plugins/PunchOutGatewayPlugin
+ * @docsCategory PunchOutGatewayPlugin
  */
 @VendurePlugin({
     imports: [PluginCommonModule],

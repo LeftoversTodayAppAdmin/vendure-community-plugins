@@ -6,7 +6,7 @@ generated: true
 
 Defines a rule that listens for a particular VendureEvent and uses that to
 make calls to the [Stellate Purging API](https://docs.stellate.co/docs/purging-api) via
-the provided [StellateService](/reference/core-plugins/stellate-plugin/stellate-service#stellateservice) instance.
+the provided [StellateService](/reference/stellate-plugin/stellate-service#stellateservice) instance.
 
 ```ts title="Signature"
 class PurgeRule<Event extends VendureEvent = VendureEvent> {
@@ -31,12 +31,12 @@ class PurgeRule<Event extends VendureEvent = VendureEvent> {
 
 ### handle
 
-<MemberInfo kind="method" type={`(handlerArgs: { events: Event[]; stellateService: <a href='/reference/core-plugins/stellate-plugin/stellate-service#stellateservice'>StellateService</a>; injector: Injector }) => `}   />
+<MemberInfo kind="method" type={`(handlerArgs: { events: Event[]; stellateService: <a href='/reference/stellate-plugin/stellate-service#stellateservice'>StellateService</a>; injector: Injector }) => `}   />
 
 
 ### constructor
 
-<MemberInfo kind="method" type={`(config: <a href='/reference/core-plugins/stellate-plugin/purge-rule#purgeruleconfig'>PurgeRuleConfig</a><Event>) => PurgeRule`}   />
+<MemberInfo kind="method" type={`(config: <a href='/reference/stellate-plugin/purge-rule#purgeruleconfig'>PurgeRuleConfig</a><Event>) => PurgeRule`}   />
 
 
 
@@ -44,7 +44,7 @@ class PurgeRule<Event extends VendureEvent = VendureEvent> {
 </div>
 <GenerationInfo sourceFile="packages/stellate-plugin/src/purge-rule.ts" sourceLine="13" packageName="@vendure-community/stellate-plugin" />
 
-Configures a [PurgeRule](/reference/core-plugins/stellate-plugin/purge-rule#purgerule).
+Configures a [PurgeRule](/reference/stellate-plugin/purge-rule#purgerule).
 
 ```ts title="Signature"
 interface PurgeRuleConfig<Event extends VendureEvent> {
@@ -73,10 +73,10 @@ How long to buffer events for in milliseconds before executing the handler. This
 us to efficiently batch calls to the Stellate Purge API.
 ### handler
 
-<MemberInfo kind="property" type={`(handlerArgs: {         events: Event[];         stellateService: <a href='/reference/core-plugins/stellate-plugin/stellate-service#stellateservice'>StellateService</a>;         injector: Injector;     }) => void | Promise<void>`}   />
+<MemberInfo kind="property" type={`(handlerArgs: {         events: Event[];         stellateService: <a href='/reference/stellate-plugin/stellate-service#stellateservice'>StellateService</a>;         injector: Injector;     }) => void | Promise<void>`}   />
 
 The function to invoke when the specified event is published. This function should use the
-[StellateService](/reference/core-plugins/stellate-plugin/stellate-service#stellateservice) instance to call the Stellate Purge API.
+[StellateService](/reference/stellate-plugin/stellate-service#stellateservice) instance to call the Stellate Purge API.
 
 
 </div>

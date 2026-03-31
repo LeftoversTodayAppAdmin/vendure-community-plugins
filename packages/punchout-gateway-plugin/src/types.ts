@@ -34,7 +34,7 @@ export interface ProductFieldMappings {
  * @description
  * Configuration options for the {@link PunchOutGatewayPlugin}.
  *
- * @docsCategory core plugins/PunchOutGatewayPlugin
+ * @docsCategory PunchOutGatewayPlugin
  */
 export interface PunchOutGatewayPluginOptions {
     /**
