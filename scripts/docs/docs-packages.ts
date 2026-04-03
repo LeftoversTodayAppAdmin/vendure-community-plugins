@@ -7,7 +7,6 @@ export interface DocsPackageConfig {
 
 /**
  * Single source of truth for the package → docs directory mapping.
- * Used by both generate-typescript-docs.ts and generate-readme-docs.ts.
  */
 export const docsPackages: DocsPackageConfig[] = [
     { packageDir: 'braintree-plugin', docsDir: 'braintree-plugin' },
