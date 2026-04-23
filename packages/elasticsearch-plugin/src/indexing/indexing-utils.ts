@@ -1,6 +1,6 @@
+import type { SearchClientAdapter } from '../adapter';
 import { DeepRequired, ID, Logger } from '@vendure/core';
 
-import type { SearchClientAdapter } from '../adapter';
 import { loggerCtx, VARIANT_INDEX_NAME } from '../constants';
 import { ElasticsearchOptions } from '../options';
 import { VariantIndexItem } from '../types';

@@ -1,11 +1,11 @@
-import type { Client, ClientOptions } from '@elastic/elasticsearch';
-
 import type {
     BulkResponseBody,
     SearchClientAdapter,
     SearchResponseBody,
     UpdateByQueryResponseBody,
 } from './search-client-adapter';
+import type { Client, ClientOptions } from '@elastic/elasticsearch';
+
 
 /**
  * Options accepted by `createElasticsearchAdapter`.
@@ -46,13 +46,13 @@ export class ElasticsearchClientNotInstalledError extends Error {
     }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
+
 function loadElasticsearchClient(): typeof import('@elastic/elasticsearch') {
     try {
         // Using require() rather than a static import so the package stays an
         // optional peer: if a consumer only uses OpenSearch, they never need
         // @elastic/elasticsearch installed.
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
+
         return require('@elastic/elasticsearch');
     } catch (e) {
         throw new ElasticsearchClientNotInstalledError();
@@ -80,11 +80,11 @@ export class ElasticsearchAdapter implements SearchClientAdapter {
             },
             exists: async ({ index }) => {
                 const result = await this.client.indices.exists({ index }, { meta: true });
-                return { body: result.body as boolean };
+                return { body: result.body };
             },
             existsAlias: async ({ name }) => {
                 const result = await this.client.indices.existsAlias({ name }, { meta: true });
-                return { body: result.body as boolean };
+                return { body: result.body };
             },
             getAlias: async ({ name, index }) => {
                 const result = await this.client.indices.getAlias({ name, index }, { meta: true });
@@ -118,7 +118,7 @@ export class ElasticsearchAdapter implements SearchClientAdapter {
 
     async ping(options?: { requestTimeout?: number }): Promise<{ body: boolean }> {
         const result = await this.client.ping({}, { meta: true, ...(options ?? {}) });
-        return { body: result.body as boolean };
+        return { body: result.body };
     }
 
     async close(): Promise<void> {

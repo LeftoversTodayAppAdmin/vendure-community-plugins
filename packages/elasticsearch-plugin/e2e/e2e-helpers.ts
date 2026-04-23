@@ -2,12 +2,12 @@ import { LogicalOperator, SortOrder } from '@vendure/common/lib/generated-types'
 import { SimpleGraphQLClient } from '@vendure/testing';
 import { expect } from 'vitest';
 
-import { searchProductsShopDocument } from './graphql/shop-definitions';
 import { deleteIndices } from '../src/indexing/indexing-utils';
 
 import { buildAdapterForBackend } from './build-adapter-for-backend';
 import { searchGetPricesDocument, searchProductsAdminDocument } from './elasticsearch-plugin.e2e-spec';
 import { VariablesOf } from './graphql/graphql-admin';
+import { searchProductsShopDocument } from './graphql/shop-definitions';
 
 type SearchInput = VariablesOf<typeof searchProductsAdminDocument>['input'];
 

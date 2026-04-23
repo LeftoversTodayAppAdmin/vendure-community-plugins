@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-non-null-assertion, no-console */
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
 import { CurrencyCode, GlobalFlag, JobState, SortOrder } from '@vendure/common/lib/generated-types';
 import { pick } from '@vendure/common/lib/pick';
 import {
@@ -16,29 +16,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
 import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
-import {
-    assignProductToChannelDocument,
-    assignProductVariantToChannelDocument,
-    createChannelDocument,
-    createCollectionDocument,
-    createFacetDocument,
-    createProductDocument,
-    createProductVariantsDocument,
-    deleteAssetDocument,
-    deleteProductDocument,
-    deleteProductVariantDocument,
-    removeProductFromChannelDocument,
-    removeProductVariantFromChannelDocument,
-    updateAssetDocument,
-    updateCollectionDocument,
-    updateProductDocument,
-    updateProductVariantsDocument,
-    updateTaxRateDocument,
-} from './graphql/shared-definitions';
-import { searchProductsShopDocument } from './graphql/shop-definitions';
-import { awaitRunningJobs } from './await-running-jobs';
 import { ElasticsearchPlugin } from '../src/plugin';
 
+import { awaitRunningJobs } from './await-running-jobs';
+import { buildAdapterForBackend } from './build-adapter-for-backend';
 import {
     doAdminSearchQuery,
     dropElasticIndices,
@@ -63,10 +44,30 @@ import {
     testSinglePrices,
 } from './e2e-helpers';
 import { graphql, ResultOf } from './graphql/graphql-admin';
+import {
+    assignProductToChannelDocument,
+    assignProductVariantToChannelDocument,
+    createChannelDocument,
+    createCollectionDocument,
+    createFacetDocument,
+    createProductDocument,
+    createProductVariantsDocument,
+    deleteAssetDocument,
+    deleteProductDocument,
+    deleteProductVariantDocument,
+    removeProductFromChannelDocument,
+    removeProductVariantFromChannelDocument,
+    updateAssetDocument,
+    updateCollectionDocument,
+    updateProductDocument,
+    updateProductVariantsDocument,
+    updateTaxRateDocument,
+} from './graphql/shared-definitions';
+import { searchProductsShopDocument } from './graphql/shop-definitions';
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
+
+
 const { searchBackend } = require('./constants');
-import { buildAdapterForBackend } from './build-adapter-for-backend';
 
 type CreateChannelResult = NonNullable<ResultOf<typeof createChannelDocument>['createChannel']>;
 type ChannelFragment = Extract<CreateChannelResult, { id: string }>;

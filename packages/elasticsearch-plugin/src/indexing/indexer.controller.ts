@@ -1,3 +1,4 @@
+import type { SearchClientAdapter } from '../adapter';
 import { Inject, Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 import { unique } from '@vendure/common/lib/unique';
@@ -29,7 +30,6 @@ import {
 import { Observable } from 'rxjs';
 import { In, IsNull } from 'typeorm';
 
-import type { SearchClientAdapter } from '../adapter';
 import { ELASTIC_SEARCH_OPTIONS, loggerCtx, VARIANT_INDEX_NAME } from '../constants';
 import { ElasticsearchRuntimeOptions } from '../options';
 import {
@@ -390,7 +390,7 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
 
         if (result1.body.failures) {
             for (const failure of result1.body.failures) {
-                Logger.error(`${failure.cause.type}: ${failure.cause.reason as string}`, loggerCtx);
+                Logger.error(`${failure.cause.type}: ${failure.cause.reason}`, loggerCtx);
             }
         }
 
@@ -408,7 +408,7 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
 
         if (result2.body.failures) {
             for (const failure of result2.body.failures) {
-                Logger.error(`${failure.cause.type}: ${failure.cause.reason as string}`, loggerCtx);
+                Logger.error(`${failure.cause.type}: ${failure.cause.reason}`, loggerCtx);
             }
         }
 

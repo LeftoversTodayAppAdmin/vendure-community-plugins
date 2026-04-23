@@ -1,11 +1,11 @@
-import type { Client, ClientOptions } from '@opensearch-project/opensearch';
-
 import type {
     BulkResponseBody,
     SearchClientAdapter,
     SearchResponseBody,
     UpdateByQueryResponseBody,
 } from './search-client-adapter';
+import type { Client, ClientOptions } from '@opensearch-project/opensearch';
+
 
 /**
  * Options accepted by `createOpenSearchAdapter`.
@@ -34,7 +34,7 @@ export class OpenSearchClientNotInstalledError extends Error {
 
 function loadOpenSearchClient(): typeof import('@opensearch-project/opensearch') {
     try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
+
         return require('@opensearch-project/opensearch');
     } catch (e) {
         throw new OpenSearchClientNotInstalledError();

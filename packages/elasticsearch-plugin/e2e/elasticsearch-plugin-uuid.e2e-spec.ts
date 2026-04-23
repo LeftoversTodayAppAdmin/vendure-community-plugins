@@ -5,15 +5,15 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
 import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
-import { buildAdapterForBackend } from './build-adapter-for-backend';
-import { searchProductsShopDocument } from './graphql/shop-definitions';
-import { awaitRunningJobs } from './await-running-jobs';
 import { ElasticsearchPlugin } from '../src/plugin';
 
+import { awaitRunningJobs } from './await-running-jobs';
+import { buildAdapterForBackend } from './build-adapter-for-backend';
 import { graphql } from './graphql/graphql-admin';
 import { graphql as shopGraphql } from './graphql/graphql-shop';
+import { searchProductsShopDocument } from './graphql/shop-definitions';
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
+
 const { searchBackend } = require('./constants');
 
 // https://github.com/vendurehq/vendure/issues/494

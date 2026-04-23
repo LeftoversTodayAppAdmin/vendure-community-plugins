@@ -1,3 +1,4 @@
+import type { SearchClientAdapter } from './adapter';
 import { Inject, Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { SearchResultAsset } from '@vendure/common/lib/generated-types';
 import {
@@ -17,7 +18,6 @@ import {
 } from '@vendure/core';
 import equal from 'fast-deep-equal/es6';
 
-import type { SearchClientAdapter } from './adapter';
 import { buildElasticBody } from './build-elastic-body';
 import { ELASTIC_SEARCH_OPTIONS, loggerCtx, VARIANT_INDEX_NAME } from './constants';
 import { ElasticsearchIndexService } from './indexing/elasticsearch-index.service';
@@ -113,7 +113,7 @@ export class ElasticsearchService implements OnModuleInit, OnModuleDestroy {
                 let existingIndexSettings;
 
                 if (existingIndexSettingsResult.body) {
-                    existingIndexSettings = (existingIndexSettingsResult.body as Record<string, any>)[
+                    existingIndexSettings = (existingIndexSettingsResult.body)[
                         Object.keys(existingIndexSettingsResult.body)[0]
                     ].settings.index;
                 }
@@ -133,7 +133,7 @@ export class ElasticsearchService implements OnModuleInit, OnModuleDestroy {
                 const tempIndexSettingsResult = await this.adapter.indices.getSettings({
                     index: tempIndex,
                 });
-                const tempIndexSettings = (tempIndexSettingsResult.body as Record<string, any>)[tempIndex]
+                const tempIndexSettings = (tempIndexSettingsResult.body)[tempIndex]
                     ?.settings?.index;
 
                 const indexParamsToExclude = [
@@ -165,14 +165,14 @@ export class ElasticsearchService implements OnModuleInit, OnModuleDestroy {
                 else {
                     const existingIndexMappingsResult = await this.adapter.indices.getMapping({ index });
                     const existingIndexMappings =
-                        (existingIndexMappingsResult.body as Record<string, any>)[
+                        (existingIndexMappingsResult.body)[
                             Object.keys(existingIndexMappingsResult.body)[0]
                         ].mappings;
 
                     const tempIndexMappingsResult = await this.adapter.indices.getMapping({
                         index: tempIndex,
                     });
-                    const tempIndexMappings = (tempIndexMappingsResult.body as Record<string, any>)[
+                    const tempIndexMappings = (tempIndexMappingsResult.body)[
                         tempIndex
                     ].mappings;
                     if (!equal(tempIndexMappings, existingIndexMappings))
@@ -297,8 +297,8 @@ export class ElasticsearchService implements OnModuleInit, OnModuleDestroy {
                 'An error occurred when querying search backend for priceRange aggregations',
             );
         }
-        return aggregations.total && (aggregations.total as any).value != null
-            ? Number((aggregations.total as any).value)
+        return aggregations.total && (aggregations.total).value != null
+            ? Number((aggregations.total).value)
             : 0;
     }
 
@@ -434,7 +434,7 @@ export class ElasticsearchService implements OnModuleInit, OnModuleDestroy {
             throw e;
         }
 
-        return body.aggregations ? (body.aggregations.aggregation_field as any).buckets : [];
+        return body.aggregations ? (body.aggregations.aggregation_field).buckets : [];
     }
 
     async priceRange(ctx: RequestContext, input: ElasticSearchInput): Promise<SearchPriceData> {
@@ -501,17 +501,17 @@ export class ElasticsearchService implements OnModuleInit, OnModuleDestroy {
 
         return {
             range: {
-                min: (aggregations.minPrice as any).value || 0,
-                max: (aggregations.maxPrice as any).value || 0,
+                min: (aggregations.minPrice).value || 0,
+                max: (aggregations.maxPrice).value || 0,
             },
             rangeWithTax: {
-                min: (aggregations.minPriceWithTax as any).value || 0,
-                max: (aggregations.maxPriceWithTax as any).value || 0,
+                min: (aggregations.minPriceWithTax).value || 0,
+                max: (aggregations.maxPriceWithTax).value || 0,
             },
-            buckets: (aggregations.prices as any).buckets
+            buckets: (aggregations.prices).buckets
                 .map(mapPriceBuckets)
                 .filter((x: { count: number }) => 0 < x.count),
-            bucketsWithTax: (aggregations.pricesWithTax as any).buckets
+            bucketsWithTax: (aggregations.pricesWithTax).buckets
                 .map(mapPriceBuckets)
                 .filter((x: { count: number }) => 0 < x.count),
         };

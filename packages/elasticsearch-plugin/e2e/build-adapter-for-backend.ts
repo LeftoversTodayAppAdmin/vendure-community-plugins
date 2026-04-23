@@ -1,6 +1,6 @@
 import { createElasticsearchAdapter, createOpenSearchAdapter } from '../src/adapter';
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
+
 const { searchBackend, elasticsearchHost, elasticsearchPort } = require('./constants');
 
 /**
