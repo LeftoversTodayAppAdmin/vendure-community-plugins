@@ -30,7 +30,7 @@ and testing without authentication and security enabled. Refer to ElasticSearch 
 ## Installation
 
 ```shell
-npm install @elastic/elasticsearch @vendure/elasticsearch-plugin
+npm install @elastic/elasticsearch @vendure-community/elasticsearch-plugin
 ```
 
 Make sure to remove the `DefaultSearchPlugin` if it is still in the VendureConfig plugins array.
@@ -40,7 +40,7 @@ Make sure to remove the `DefaultSearchPlugin` if it is still in the VendureConfi
 Then add the `ElasticsearchPlugin`, calling the `.init()` method with `ElasticsearchOptions`:
 
 ```ts
-import { ElasticsearchPlugin } from '@vendure/elasticsearch-plugin';
+import { ElasticsearchPlugin } from '@vendure-community/elasticsearch-plugin';
 
 const config: VendureConfig = {
   // Add an instance of the plugin to the plugins array
