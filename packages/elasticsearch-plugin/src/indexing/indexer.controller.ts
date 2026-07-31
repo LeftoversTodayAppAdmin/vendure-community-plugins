@@ -513,6 +513,7 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
                 .find({
                     where: { id: productId, deletedAt: IsNull() },
                     relations: this.productRelations,
+                    relationLoadStrategy: 'query',
                 })
                 .then(result => result[0] ?? undefined);
         } catch (e: any) {
@@ -533,6 +534,7 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
                 order: {
                     id: 'ASC',
                 },
+                relationLoadStrategy: 'query',
             });
         } catch (e: any) {
             Logger.error(e.message, loggerCtx, e.stack);
