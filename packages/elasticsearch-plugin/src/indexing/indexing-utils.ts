@@ -5,6 +5,34 @@ import { loggerCtx, VARIANT_INDEX_NAME } from '../constants';
 import { ElasticsearchOptions } from '../options';
 import { VariantIndexItem } from '../types';
 
+/**
+ * Renders an error thrown by the search client as a human-readable string.
+ *
+ * `JSON.stringify()` must not be used for this. On the Elasticsearch/OpenSearch
+ * client error classes `message` and `stack` are non-enumerable, so serializing
+ * silently drops them: a `TimeoutError` stringifies to
+ * `{"name":"TimeoutError","meta":{}}`, losing the only part a human can act on.
+ */
+export function describeSearchClientError(e: unknown): string {
+    if (typeof e !== 'object' || e === null) {
+        return String(e);
+    }
+    const error = e as { message?: unknown; meta?: { body?: unknown }; body?: unknown };
+    const message = typeof error.message === 'string' ? error.message : String(e);
+    const responseBody = error.meta?.body ?? error.body;
+    if (responseBody === undefined) {
+        return message;
+    }
+    let serializedBody: string;
+    try {
+        serializedBody =
+            typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody);
+    } catch {
+        serializedBody = '[response body could not be serialized]';
+    }
+    return `${message} (response: ${serializedBody})`;
+}
+
 export async function createIndices(
     adapter: SearchClientAdapter,
     prefix: string,
@@ -95,13 +123,20 @@ export async function createIndices(
         }
     };
 
-    try {
-        const index = prefix + VARIANT_INDEX_NAME + `${unixtimestampPostfix}`;
-        const alias = prefix + VARIANT_INDEX_NAME + aliasPostfix;
+    const indexName = prefix + VARIANT_INDEX_NAME + `${unixtimestampPostfix}`;
+    const aliasName = prefix + VARIANT_INDEX_NAME + aliasPostfix;
 
-        await createIndex(variantMappings, index, alias);
+    try {
+        await createIndex(variantMappings, indexName, aliasName);
     } catch (e: any) {
-        Logger.error(JSON.stringify(e, null, 2), loggerCtx);
+        Logger.error(
+            `Could not create index "${mapAlias ? indexName : aliasName}": ${describeSearchClientError(e)}`,
+            loggerCtx,
+        );
+        // Rethrow: the index does not exist, so a caller that carries on as if it did
+        // will fail later with a much less obvious error (or silently index nothing).
+        // Callers that can tolerate the failure catch it themselves.
+        throw e;
     }
 }
 
