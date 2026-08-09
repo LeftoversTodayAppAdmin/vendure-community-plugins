@@ -84,6 +84,17 @@ export class ElasticsearchIndexService implements OnApplicationBootstrap {
         return this.updateIndexQueue.add({ type: 'update-variants', ctx: ctx.serialize(), variantIds }, { ctx });
     }
 
+    async updateVariantsForStockMovement(ctx: RequestContext, variants: ProductVariant[]) {
+        if (await this.indexerController.stockMovementWouldChangeIndex(ctx, variants)) {
+            return this.updateVariants(ctx, variants);
+        }
+        Logger.debug(
+            'Skipping index update for stock movement: indexed stock status unchanged',
+            loggerCtx,
+        );
+        return undefined;
+    }
+
     deleteProduct(ctx: RequestContext, product: Product) {
         return this.updateIndexQueue.add({
             type: 'delete-product',

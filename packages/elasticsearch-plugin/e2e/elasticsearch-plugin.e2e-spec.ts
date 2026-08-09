@@ -95,6 +95,7 @@ describe(`Elasticsearch plugin [${searchBackend as string}]`, () => {
                 ElasticsearchPlugin.init({
                     indexPrefix: INDEX_PREFIX,
                     adapter: buildAdapterForBackend(),
+                    skipUnchangedIndexUpdates: true,
                     hydrateProductVariantRelations: ['customFields.material', 'stockLevels'],
                     customProductVariantMappings: {
                         inStock: {
@@ -1696,6 +1697,58 @@ describe(`Elasticsearch plugin [${searchBackend as string}]`, () => {
                 });
                 expect(result.search.items.map(i => i.productName)).toContain(PRODUCT_NAME);
             });
+        });
+    });
+
+    // The whole suite runs with skipUnchangedIndexUpdates enabled (see the plugin config above),
+    // so every existing test already exercises the guard on real updates. These add explicit
+    // stock-movement cases: a non-boundary movement must leave search correct, and a movement
+    // that flips inStock must be reflected.
+    describe('skipUnchangedIndexUpdates', () => {
+        async function inStockVariantIds(inStock: boolean): Promise<string[]> {
+            const result = await shopClient.query(searchProductsShopDocument, {
+                input: { groupByProduct: false, inStock, take: 200 },
+            });
+            return result.search.items.map(i => i.productVariantId);
+        }
+
+        let variantId: string;
+
+        it('finds an in-stock variant to exercise', async () => {
+            const ids = await inStockVariantIds(true);
+            expect(ids.length).toBeGreaterThan(0);
+            variantId = ids[0];
+        });
+
+        it('keeps search correct after a non-boundary stock movement', async () => {
+            await adminClient.query(updateProductVariantsDocument, {
+                input: [{ id: variantId, trackInventory: GlobalFlag.TRUE, stockOnHand: 100 }],
+            });
+            await awaitRunningJobs(adminClient);
+            await adminClient.query(updateProductVariantsDocument, {
+                input: [{ id: variantId, trackInventory: GlobalFlag.TRUE, stockOnHand: 99 }],
+            });
+            await awaitRunningJobs(adminClient);
+            expect(await inStockVariantIds(true)).toContain(variantId);
+            expect(await inStockVariantIds(false)).not.toContain(variantId);
+        });
+
+        it('reflects a stock movement that flips the variant out of stock', async () => {
+            await adminClient.query(updateProductVariantsDocument, {
+                input: [{ id: variantId, trackInventory: GlobalFlag.TRUE, stockOnHand: 0 }],
+            });
+            await awaitRunningJobs(adminClient);
+            expect(await inStockVariantIds(true)).not.toContain(variantId);
+            expect(await inStockVariantIds(false)).toContain(variantId);
+        });
+
+        it('reflects a stock movement that flips the variant back in stock', async () => {
+            await adminClient.query(updateProductVariantsDocument, {
+                input: [{ id: variantId, trackInventory: GlobalFlag.TRUE, stockOnHand: 50 }],
+            });
+            await awaitRunningJobs(adminClient);
+            expect(await inStockVariantIds(true)).toContain(variantId);
+            expect(await inStockVariantIds(false)).not.toContain(variantId);
         });
     });
 });

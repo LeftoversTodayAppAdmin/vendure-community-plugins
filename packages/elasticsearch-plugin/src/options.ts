@@ -57,6 +57,28 @@ export interface ElasticsearchOptions {
     adapter: () => SearchClientAdapter;
     /**
      * @description
+     * Whether a `StockMovementEvent` triggers a search index update. `'always'` enqueues an update
+     * for every movement (historic behaviour). `'onStockStatusChange'` only enqueues when the
+     * movement flips a variant's `inStock` or its product's `productInStock`, skipping re-indexing
+     * on stock count changes that leave the indexed document unchanged. Only safe when no custom
+     * mapping derives its value from stock levels, since the check inspects the built-in stock
+     * booleans; otherwise keep `'always'` and use {@link ElasticsearchOptions.skipUnchangedIndexUpdates}.
+     *
+     * @default 'always'
+     */
+    reindexOnStockMovement?: 'always' | 'onStockStatusChange';
+    /**
+     * @description
+     * When `true`, the indexer skips the bulk write for a product whose freshly-built document is
+     * identical to what is already indexed, avoiding a redundant write and the delete-then-recreate
+     * that briefly drops the product from search results. It compares the whole document, so it is
+     * correct for any mapping configuration. A full reindex is never skipped.
+     *
+     * @default false
+     */
+    skipUnchangedIndexUpdates?: boolean;
+    /**
+     * @description
      * Maximum amount of attempts made to connect to the search server on
      * startup.
      *
@@ -730,6 +752,8 @@ const ADAPTER_PLACEHOLDER: () => SearchClientAdapter = () => ({}) as unknown as 
 
 export const defaultOptions: ElasticsearchRuntimeOptions = {
     adapter: ADAPTER_PLACEHOLDER,
+    reindexOnStockMovement: 'always',
+    skipUnchangedIndexUpdates: false,
     connectionAttempts: 10,
     connectionAttemptInterval: 5000,
     indexPrefix: 'vendure-',

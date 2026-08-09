@@ -46,6 +46,7 @@ import {
     VariantIndexItem,
 } from '../types';
 
+import { indexedDocumentsMatch, targetDocumentsById } from './index-diff';
 import { createIndices, getIndexNameByAlias } from './indexing-utils';
 
 export const defaultProductRelations: Array<EntityRelationPaths<Product>> = [
@@ -191,6 +192,110 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
             await this.updateProductsInternal(ctx, productIds);
             return true;
         });
+    }
+
+    /**
+     * Pre-enqueue guard for stock movements: returns `true` if the movement would change a
+     * product's indexed `inStock`/`productInStock` (so the caller should enqueue an update),
+     * `false` if not. Only active for `reindexOnStockMovement: 'onStockStatusChange'`; otherwise
+     * always `true`. Any evaluation failure returns `true` (the safe default).
+     */
+    async stockMovementWouldChangeIndex(ctx: RequestContext, variants: ProductVariant[]): Promise<boolean> {
+        if (this.options.reindexOnStockMovement !== 'onStockStatusChange') {
+            return true;
+        }
+        try {
+            const mutableCtx = MutableRequestContext.deserialize(ctx.serialize());
+            const productIds = await this.getProductIdsByVariantIds(variants.map(v => v.id));
+            for (const productId of productIds) {
+                if (await this.productStockStatusDiffersFromIndex(mutableCtx, productId)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (e: any) {
+            Logger.warn(
+                `Stock-movement guard could not evaluate, will enqueue an update: ${e.message}`,
+                loggerCtx,
+            );
+            return true;
+        }
+    }
+
+    /**
+     * Recomputes a product's per-channel stock booleans and compares them to what is currently
+     * indexed. Returns `true` if any variant `inStock` or the product `productInStock` differs, or
+     * if the product is not indexed yet.
+     */
+    private async productStockStatusDiffersFromIndex(
+        ctx: MutableRequestContext,
+        productId: ID,
+    ): Promise<boolean> {
+        const result = await this.adapter.search({
+            index: this.options.indexPrefix + VARIANT_INDEX_NAME,
+            body: {
+                query: { term: { productId } },
+                _source: ['channelId', 'productVariantId', 'inStock', 'productInStock'],
+                size: 10000,
+            },
+        });
+        const hits = (result.body.hits?.hits ?? []) as Array<{ _source: any }>;
+        if (hits.length === 0) {
+            // Not indexed yet; enqueue so the document gets created.
+            return true;
+        }
+        const product = await this.connection.getRepository(ctx, Product).findOne({
+            where: { id: productId, deletedAt: IsNull() },
+            relations: ['channels', 'variants', 'variants.channels'],
+        });
+        if (!product) {
+            return true;
+        }
+        const indexedByChannel = new Map<
+            string,
+            Array<{ variantId: string; inStock: boolean; productInStock: boolean }>
+        >();
+        for (const hit of hits) {
+            const key = String(hit._source.channelId);
+            const bucket = indexedByChannel.get(key) ?? [];
+            bucket.push({
+                variantId: String(hit._source.productVariantId),
+                inStock: !!hit._source.inStock,
+                productInStock: !!hit._source.productInStock,
+            });
+            indexedByChannel.set(key, bucket);
+        }
+        const originalChannel = ctx.channel;
+        try {
+            for (const channel of product.channels) {
+                const channelDocs = indexedByChannel.get(String(channel.id));
+                if (!channelDocs) {
+                    continue;
+                }
+                ctx.setChannel(channel);
+                const variantsInChannel = product.variants.filter(v =>
+                    v.channels.map(c => c.id).includes(channel.id),
+                );
+                const currentInStockByVariant = new Map<string, boolean>();
+                for (const variant of variantsInChannel) {
+                    const saleable = await this.productVariantService.getSaleableStockLevel(ctx, variant);
+                    currentInStockByVariant.set(String(variant.id), 0 < saleable);
+                }
+                const currentProductInStock = await this.getProductInStockValue(ctx, variantsInChannel);
+                for (const doc of channelDocs) {
+                    if (currentProductInStock !== doc.productInStock) {
+                        return true;
+                    }
+                    const currentInStock = currentInStockByVariant.get(doc.variantId);
+                    if (currentInStock !== undefined && currentInStock !== doc.inStock) {
+                        return true;
+                    }
+                }
+            }
+        } finally {
+            ctx.setChannel(originalChannel);
+        }
+        return false;
     }
 
     async deleteVariants({ ctx: rawContext, variantIds }: UpdateVariantMessageData): Promise<boolean> {
@@ -500,12 +605,17 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
         }
     }
 
-    private async updateProductsOperationsOnly(
+    /**
+     * Builds (but does not execute) the upsert operations for a single product's variant
+     * documents. Split out from {@link updateProductsOperationsOnly} so the incremental update
+     * path can build the target documents, compare them against what is currently indexed, and
+     * skip the write entirely when nothing changed (see `skipUnchangedIndexUpdates`).
+     */
+    private async buildProductVariantOperations(
         ctx: MutableRequestContext,
         productId: ID,
-        index = VARIANT_INDEX_NAME,
-    ): Promise<void> {
-        let operations: BulkVariantOperation[] = [];
+    ): Promise<BulkVariantOperation[]> {
+        const operations: BulkVariantOperation[] = [];
         let product: Product | undefined;
         try {
             product = await this.connection
@@ -520,7 +630,7 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
             throw e;
         }
         if (!product) {
-            return;
+            return [];
         }
         let updatedProductVariants: ProductVariant[] = [];
         try {
@@ -589,16 +699,6 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
                                 },
                             },
                         );
-
-                        if (operations.length >= this.options.reindexBulkOperationSizeLimit) {
-                            // Because we can have a huge amount of variant for 1 product, we also chunk update operations
-                            await this.executeBulkOperationsByChunks(
-                                this.options.reindexBulkOperationSizeLimit,
-                                operations,
-                                index,
-                            );
-                            operations = [];
-                        }
                     }
                 } else {
                     operations.push(
@@ -623,36 +723,88 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
                         },
                     );
                 }
-                if (operations.length >= this.options.reindexBulkOperationSizeLimit) {
-                    // Because we can have a huge amount of variant for 1 product, we also chunk update operations
-                    await this.executeBulkOperationsByChunks(
-                        this.options.reindexBulkOperationSizeLimit,
-                        operations,
-                        index,
-                    );
-                    operations = [];
-                }
             }
         }
         ctx.setChannel(originalChannel);
 
-        // Because we can have a huge amount of variant for 1 product, we also chunk update operations
+        return operations;
+    }
+
+    private async updateProductsOperationsOnly(
+        ctx: MutableRequestContext,
+        productId: ID,
+        index = VARIANT_INDEX_NAME,
+    ): Promise<void> {
+        const operations = await this.buildProductVariantOperations(ctx, productId);
+        // Because we can have a huge amount of variants for 1 product, we chunk update operations
         await this.executeBulkOperationsByChunks(
             this.options.reindexBulkOperationSizeLimit,
             operations,
             index,
         );
-
-        return;
     }
 
     private async updateProductsOperations(ctx: MutableRequestContext, productIds: ID[]): Promise<void> {
         Logger.debug(`Updating ${productIds.length} Products`, loggerCtx);
         for (const productId of productIds) {
-            await this.deleteProductOperations(ctx, productId);
-            await this.updateProductsOperationsOnly(ctx, productId);
+            if (this.options.skipUnchangedIndexUpdates) {
+                // Skip both the delete and the recreate when the built documents match what is
+                // already indexed (avoids a redundant write and the delete-then-recreate flicker).
+                const operations = await this.buildProductVariantOperations(ctx, productId);
+                if (await this.isProductIndexUnchanged(ctx, productId, operations)) {
+                    Logger.debug(
+                        `Skipping reindex of product ${productId}: indexed documents unchanged`,
+                        loggerCtx,
+                    );
+                    continue;
+                }
+                await this.deleteProductOperations(ctx, productId);
+                await this.executeBulkOperationsByChunks(
+                    this.options.reindexBulkOperationSizeLimit,
+                    operations,
+                );
+            } else {
+                await this.deleteProductOperations(ctx, productId);
+                await this.updateProductsOperationsOnly(ctx, productId);
+            }
         }
         return;
+    }
+
+    /**
+     * Returns `true` when a product's freshly-built documents are identical to what is currently
+     * indexed (same ids and content). Any read failure returns `false` (write, the safe default).
+     */
+    private async isProductIndexUnchanged(
+        ctx: RequestContext,
+        productId: ID,
+        operations: BulkVariantOperation[],
+    ): Promise<boolean> {
+        const targetById = targetDocumentsById(operations);
+        if (targetById.size === 0) {
+            // Nothing to index for this product; let the normal path handle it.
+            return false;
+        }
+        let currentHits: Array<{ _id: string; _source: any }>;
+        try {
+            const result = await this.adapter.search({
+                index: this.options.indexPrefix + VARIANT_INDEX_NAME,
+                body: {
+                    // productId is a keyword, so this term matches every document for the product.
+                    query: { term: { productId } },
+                    size: 10000,
+                    _source: true,
+                },
+            });
+            currentHits = result.body.hits?.hits ?? [];
+        } catch (e: any) {
+            Logger.warn(
+                `Could not read current index state for product ${productId}, will write: ${e.message}`,
+                loggerCtx,
+            );
+            return false;
+        }
+        return indexedDocumentsMatch(targetById, currentHits);
     }
 
     /**
