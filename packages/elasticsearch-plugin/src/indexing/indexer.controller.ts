@@ -531,13 +531,14 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
                     productId,
                     deletedAt: IsNull(),
                 },
-                order: {
-                    id: 'ASC',
-                },
                 relationLoadStrategy: 'query',
             });
+            // TypeORM's query strategy reads each relation path from the `order` option
+            // without a null guard (typeorm/typeorm#12788), so sort after hydration instead.
+            updatedProductVariants.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
         } catch (e: any) {
             Logger.error(e.message, loggerCtx, e.stack);
+            throw e;
         }
 
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
