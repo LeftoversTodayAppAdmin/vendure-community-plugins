@@ -740,13 +740,25 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
     }
 
     /**
-     * The pair of bulk operations that write a single built document. Uses the `index` action (a
-     * full-document replace keyed by `_id`) rather than a partial `update`, so a field that is no
-     * longer present in the freshly built document is cleared instead of lingering from a previous
-     * version. Because it replaces the document in place, it never removes it first, so the product
-     * does not drop out of search the way the previous delete-then-recreate did.
+     * The pair of bulk operations that upsert a single built document, matching the historic write:
+     * an `update` keyed by `_id` with `doc_as_upsert`. Used by the reindex and non-incremental paths,
+     * which delete before writing (or write to a fresh index), so a partial update never leaves a
+     * stale field behind.
      */
     private documentToOperations(id: string, document: VariantIndexItem): BulkVariantOperation[] {
+        return [
+            { index: VARIANT_INDEX_NAME, operation: { update: { _id: id } } },
+            { index: VARIANT_INDEX_NAME, operation: { doc: document, doc_as_upsert: true } },
+        ];
+    }
+
+    /**
+     * The pair of bulk operations that replace a single built document in place: an `index` action
+     * (a full-document replace keyed by `_id`). Used by the incremental path, which writes over an
+     * existing document without deleting it first, so a full replace is needed to clear a field that
+     * is no longer present in the freshly built document.
+     */
+    private documentToReplaceOperations(id: string, document: VariantIndexItem): BulkVariantOperation[] {
         return [
             { index: VARIANT_INDEX_NAME, operation: { index: { _id: id } } },
             { index: VARIANT_INDEX_NAME, operation: document },
@@ -855,7 +867,7 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
         }
         for (const id of upsertIds) {
             // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-            operations.push(...this.documentToOperations(id, builtById.get(id)!));
+            operations.push(...this.documentToReplaceOperations(id, builtById.get(id)!));
         }
         await this.executeBulkOperationsByChunks(this.options.reindexBulkOperationSizeLimit, operations);
     }

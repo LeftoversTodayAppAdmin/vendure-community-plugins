@@ -82,18 +82,19 @@ export interface ElasticsearchOptions {
     reindexOnStockMovement?: 'always' | 'onStockStatusChange';
     /**
      * @description
-     * When `true`, an incremental product update reads the product's currently indexed documents,
-     * compares them field-for-field against the freshly built documents, and writes only what
-     * actually changed: it upserts the documents that differ or are new, deletes the documents that
-     * no longer exist, and leaves the rest untouched. When nothing changed it writes nothing.
+     * Opt-in. When `true`, an incremental product update reads the product's currently indexed
+     * documents, compares them field-for-field against the freshly built documents, and writes only
+     * what actually changed: it upserts the documents that differ or are new, deletes the documents
+     * that no longer exist, and leaves the rest untouched. When nothing changed it writes nothing.
      *
-     * This replaces the previous delete-then-recreate behaviour, during which a product briefly
-     * dropped out of search results, and it avoids redundant writes from any trigger. Because it
-     * compares the whole document, it is correct for any mapping configuration. A full reindex still
-     * writes every document. Products too large to diff safely fall back to the streaming
-     * delete-then-recreate path.
+     * This replaces the default delete-then-recreate write, during which a product briefly drops out
+     * of search results, and it avoids redundant writes from any trigger. Because it compares the
+     * whole document, it is correct for any mapping configuration. A full reindex still writes every
+     * document. Products too large to diff safely fall back to the delete-then-recreate path.
      *
-     * @default true
+     * When `false` (the default) the historic delete-then-recreate behaviour is used unchanged.
+     *
+     * @default false
      * @since 2.2.0
      */
     incrementalIndexUpdates?: boolean;
@@ -773,7 +774,7 @@ const ADAPTER_PLACEHOLDER: () => SearchClientAdapter = () => ({}) as unknown as 
 export const defaultOptions: ElasticsearchRuntimeOptions = {
     adapter: ADAPTER_PLACEHOLDER,
     reindexOnStockMovement: 'always',
-    incrementalIndexUpdates: true,
+    incrementalIndexUpdates: false,
     connectionAttempts: 10,
     connectionAttemptInterval: 5000,
     indexPrefix: 'vendure-',
