@@ -57,13 +57,15 @@ export interface ElasticsearchOptions {
     adapter: () => SearchClientAdapter;
     /**
      * @description
-     * Controls whether a `StockMovementEvent` enqueues a search index update job.
+     * Controls whether a stock change enqueues a search index update job. This covers both a
+     * `StockMovementEvent` (an order-driven sale or allocation) and a `ProductVariantEvent` whose
+     * admin update touched only stock-level fields.
      *
-     * With `'always'` (the historic behaviour) every movement enqueues an update. With
-     * `'onStockStatusChange'` the plugin checks, before creating a job, whether the movement would
+     * With `'always'` (the historic behaviour) every stock change enqueues an update. With
+     * `'onStockStatusChange'` the plugin checks, before creating a job, whether the change would
      * flip a variant's `inStock` or its product's `productInStock`, and skips the job when it would
      * not. This avoids the queue write, the poll wait and the worker cycle for stock changes that
-     * cannot affect search results (for example a 50 to 49 movement that leaves the item in stock).
+     * cannot affect search results (for example a 50 to 49 change that leaves the item in stock).
      *
      * This check reads only the built-in stock booleans, so it is applied only when neither
      * `customProductMappings` nor `customProductVariantMappings` are configured. When either is set,

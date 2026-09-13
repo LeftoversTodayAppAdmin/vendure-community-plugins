@@ -17,6 +17,7 @@ import { loggerCtx } from '../constants';
 import { UpdateIndexQueueJobData } from '../types';
 
 import { ElasticsearchIndexerController, ReindexMessageResponse } from './indexer.controller';
+import { isStockOnlyVariantUpdate } from './stock-only-update';
 
 @Injectable()
 export class ElasticsearchIndexService implements OnApplicationBootstrap {
@@ -93,6 +94,28 @@ export class ElasticsearchIndexService implements OnApplicationBootstrap {
             loggerCtx,
         );
         return undefined;
+    }
+
+    /**
+     * Enqueue handler for a `ProductVariantEvent` 'updated'. When the admin update touched only
+     * stock-level fields, the same pre-enqueue stock guard as `StockMovementEvent` applies, so a
+     * change that does not flip the indexed stock status creates no job. Any other update (or any
+     * update while a stock-derived custom mapping is configured, which disables the guard) enqueues
+     * as before.
+     */
+    async updateVariantsForVariantEvent(
+        ctx: RequestContext,
+        variants: ProductVariant[],
+        input: unknown,
+    ) {
+        if (isStockOnlyVariantUpdate(input) && !(await this.indexerController.stockMovementWouldChangeIndex(ctx, variants))) {
+            Logger.debug(
+                'Skipping index update for variant update: only stock changed and indexed stock status is unchanged',
+                loggerCtx,
+            );
+            return undefined;
+        }
+        return this.updateVariants(ctx, variants);
     }
 
     deleteProduct(ctx: RequestContext, product: Product) {
