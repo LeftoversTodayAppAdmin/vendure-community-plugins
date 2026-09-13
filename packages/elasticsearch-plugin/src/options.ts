@@ -57,26 +57,44 @@ export interface ElasticsearchOptions {
     adapter: () => SearchClientAdapter;
     /**
      * @description
-     * Whether a `StockMovementEvent` triggers a search index update. `'always'` enqueues an update
-     * for every movement (historic behaviour). `'onStockStatusChange'` only enqueues when the
-     * movement flips a variant's `inStock` or its product's `productInStock`, skipping re-indexing
-     * on stock count changes that leave the indexed document unchanged. Only safe when no custom
-     * mapping derives its value from stock levels, since the check inspects the built-in stock
-     * booleans; otherwise keep `'always'` and use {@link ElasticsearchOptions.skipUnchangedIndexUpdates}.
+     * Controls whether a `StockMovementEvent` enqueues a search index update job.
+     *
+     * With `'always'` (the historic behaviour) every movement enqueues an update. With
+     * `'onStockStatusChange'` the plugin checks, before creating a job, whether the movement would
+     * flip a variant's `inStock` or its product's `productInStock`, and skips the job when it would
+     * not. This avoids the queue write, the poll wait and the worker cycle for stock changes that
+     * cannot affect search results (for example a 50 to 49 movement that leaves the item in stock).
+     *
+     * This check reads only the built-in stock booleans, so it is applied only when neither
+     * `customProductMappings` nor `customProductVariantMappings` are configured. When either is set,
+     * a custom field could derive from stock levels and change without an `inStock` flip, so the
+     * plugin automatically falls back to `'always'` to stay correct. Any evaluation failure also
+     * falls back to enqueuing.
+     *
+     * It is a pre-enqueue optimisation only, complementary to
+     * {@link ElasticsearchOptions.incrementalIndexUpdates}, which governs the write itself.
      *
      * @default 'always'
+     * @since 2.2.0
      */
     reindexOnStockMovement?: 'always' | 'onStockStatusChange';
     /**
      * @description
-     * When `true`, the indexer skips the bulk write for a product whose freshly-built document is
-     * identical to what is already indexed, avoiding a redundant write and the delete-then-recreate
-     * that briefly drops the product from search results. It compares the whole document, so it is
-     * correct for any mapping configuration. A full reindex is never skipped.
+     * When `true`, an incremental product update reads the product's currently indexed documents,
+     * compares them field-for-field against the freshly built documents, and writes only what
+     * actually changed: it upserts the documents that differ or are new, deletes the documents that
+     * no longer exist, and leaves the rest untouched. When nothing changed it writes nothing.
      *
-     * @default false
+     * This replaces the previous delete-then-recreate behaviour, during which a product briefly
+     * dropped out of search results, and it avoids redundant writes from any trigger. Because it
+     * compares the whole document, it is correct for any mapping configuration. A full reindex still
+     * writes every document. Products too large to diff safely fall back to the streaming
+     * delete-then-recreate path.
+     *
+     * @default true
+     * @since 2.2.0
      */
-    skipUnchangedIndexUpdates?: boolean;
+    incrementalIndexUpdates?: boolean;
     /**
      * @description
      * Maximum amount of attempts made to connect to the search server on
@@ -753,7 +771,7 @@ const ADAPTER_PLACEHOLDER: () => SearchClientAdapter = () => ({}) as unknown as 
 export const defaultOptions: ElasticsearchRuntimeOptions = {
     adapter: ADAPTER_PLACEHOLDER,
     reindexOnStockMovement: 'always',
-    skipUnchangedIndexUpdates: false,
+    incrementalIndexUpdates: true,
     connectionAttempts: 10,
     connectionAttemptInterval: 5000,
     indexPrefix: 'vendure-',

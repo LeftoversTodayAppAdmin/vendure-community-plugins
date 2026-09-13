@@ -1,124 +1,111 @@
 import { describe, expect, it } from 'vitest';
 
-import { indexedDocumentsMatch, stableStringify, targetDocumentsById } from './index-diff';
+import { builtDocumentMatchesIndexed, diffProductDocuments, IndexedDocument } from './index-diff';
 
-describe('stableStringify', () => {
-    it('is independent of object key order', () => {
-        expect(stableStringify({ a: 1, b: 2 })).toBe(stableStringify({ b: 2, a: 1 }));
+describe('builtDocumentMatchesIndexed', () => {
+    it('matches regardless of key order', () => {
+        const built = { inStock: true, sku: 'A', facetIds: ['1', '2'] };
+        const indexed = { facetIds: ['1', '2'], sku: 'A', inStock: true };
+        expect(builtDocumentMatchesIndexed(built, indexed)).toBe(true);
     });
 
-    it('is independent of key order in nested objects', () => {
-        const x = { outer: { a: 1, b: { c: 3, d: 4 } } };
-        const y = { outer: { b: { d: 4, c: 3 }, a: 1 } };
-        expect(stableStringify(x)).toBe(stableStringify(y));
+    it('does not match when a field differs', () => {
+        expect(builtDocumentMatchesIndexed({ inStock: true }, { inStock: false })).toBe(false);
     });
 
-    it('preserves array order (arrays are position-sensitive)', () => {
-        expect(stableStringify([1, 2, 3])).not.toBe(stableStringify([3, 2, 1]));
-        expect(stableStringify(['a', 'b'])).toBe(stableStringify(['a', 'b']));
+    it('treats an undefined field the same as an absent one (as the index stores it)', () => {
+        // Elasticsearch drops undefined fields from _source, so the built doc must compare equal.
+        expect(builtDocumentMatchesIndexed({ sku: 'A', productAssetId: undefined }, { sku: 'A' })).toBe(true);
     });
 
-    it('omits undefined values so they equal an absent key', () => {
-        expect(stableStringify({ a: 1, b: undefined })).toBe(stableStringify({ a: 1 }));
+    it('matches a Date against the ISO string the index stores', () => {
+        // The old stableStringify serialised a Date to {}, so a Date-valued custom mapping never
+        // matched its own _source and the update was never skipped. The JSON round-trip fixes this.
+        const date = new Date('2026-01-02T03:04:05.000Z');
+        const built = { 'product-restockAt': date };
+        const indexed = { 'product-restockAt': '2026-01-02T03:04:05.000Z' };
+        expect(builtDocumentMatchesIndexed(built, indexed)).toBe(true);
     });
 
-    it('distinguishes null from absent/undefined', () => {
-        expect(stableStringify({ a: null })).not.toBe(stableStringify({}));
-        expect(stableStringify(null)).toBe('null');
+    it('distinguishes a number from a numeric string', () => {
+        expect(builtDocumentMatchesIndexed({ n: 2 }, { n: '2' })).toBe(false);
     });
 
-    it('serializes primitives', () => {
-        expect(stableStringify('x')).toBe('"x"');
-        expect(stableStringify(42)).toBe('42');
-        expect(stableStringify(true)).toBe('true');
-    });
-
-    it('distinguishes number from numeric string', () => {
-        expect(stableStringify({ n: 2 })).not.toBe(stableStringify({ n: '2' }));
+    it('is array-order sensitive', () => {
+        expect(builtDocumentMatchesIndexed({ facetIds: ['1', '2'] }, { facetIds: ['2', '1'] })).toBe(false);
     });
 });
 
-describe('targetDocumentsById', () => {
-    const update = (id: string) => ({ operation: { update: { _id: id } } });
-    const doc = (d: unknown) => ({ operation: { doc: d, doc_as_upsert: true } });
-
-    it('pairs each update op with the following doc op', () => {
-        const ops = [update('1_10_en'), doc({ inStock: true }), update('1_11_en'), doc({ inStock: false })];
-        const result = targetDocumentsById(ops);
-        expect(result.size).toBe(2);
-        expect(result.get('1_10_en')).toEqual({ inStock: true });
-        expect(result.get('1_11_en')).toEqual({ inStock: false });
-    });
-
-    it('returns an empty map for no operations', () => {
-        expect(targetDocumentsById([]).size).toBe(0);
-    });
-
-    it('ignores a trailing update op with no following doc', () => {
-        const ops = [update('1_10_en'), doc({ inStock: true }), update('1_11_en')];
-        const result = targetDocumentsById(ops);
-        expect(result.size).toBe(1);
-        expect(result.has('1_11_en')).toBe(false);
-    });
-
-    it('coerces numeric ids to strings', () => {
-        const ops = [{ operation: { update: { _id: 5 } } }, doc({ inStock: true })];
-        expect(targetDocumentsById(ops).has('5')).toBe(true);
-    });
-});
-
-describe('indexedDocumentsMatch', () => {
-    const target = new Map<string, unknown>([
-        ['1_10_en', { inStock: true, productInStock: true, sku: 'A', facetIds: ['1', '2'] }],
-        ['1_11_en', { inStock: false, productInStock: true, sku: 'B', facetIds: [] }],
+describe('diffProductDocuments', () => {
+    const built = new Map<string, unknown>([
+        ['1_10_en', { inStock: true, sku: 'A', facetIds: ['1', '2'] }],
+        ['1_11_en', { inStock: false, sku: 'B', facetIds: [] }],
     ]);
 
-    it('returns true when ids and content match (ignoring key order)', () => {
-        const hits = [
-            // deliberately reordered keys in _source
-            { _id: '1_11_en', _source: { facetIds: [], sku: 'B', productInStock: true, inStock: false } },
-            { _id: '1_10_en', _source: { facetIds: ['1', '2'], sku: 'A', inStock: true, productInStock: true } },
+    it('returns no changes when the index already matches (key order aside)', () => {
+        const current: IndexedDocument[] = [
+            { _id: '1_11_en', _source: { facetIds: [], sku: 'B', inStock: false } },
+            { _id: '1_10_en', _source: { facetIds: ['1', '2'], sku: 'A', inStock: true } },
         ];
-        expect(indexedDocumentsMatch(target, hits)).toBe(true);
+        const { upsertIds, deleteIds } = diffProductDocuments(built, current);
+        expect(upsertIds).toEqual([]);
+        expect(deleteIds).toEqual([]);
     });
 
-    it('returns false when a document field differs (e.g. inStock flipped)', () => {
-        const hits = [
-            { _id: '1_10_en', _source: { inStock: false, productInStock: true, sku: 'A', facetIds: ['1', '2'] } },
-            { _id: '1_11_en', _source: { inStock: false, productInStock: true, sku: 'B', facetIds: [] } },
+    it('upserts only the document whose content changed', () => {
+        const current: IndexedDocument[] = [
+            { _id: '1_10_en', _source: { inStock: false, sku: 'A', facetIds: ['1', '2'] } },
+            { _id: '1_11_en', _source: { inStock: false, sku: 'B', facetIds: [] } },
         ];
-        expect(indexedDocumentsMatch(target, hits)).toBe(false);
+        const { upsertIds, deleteIds } = diffProductDocuments(built, current);
+        expect(upsertIds).toEqual(['1_10_en']);
+        expect(deleteIds).toEqual([]);
     });
 
-    it('returns false when a stock-derived custom field differs (guards the onStockStatusChange caveat)', () => {
-        const targetWithCustom = new Map<string, unknown>([
+    it('upserts a new document that is not yet indexed', () => {
+        const current: IndexedDocument[] = [
+            { _id: '1_10_en', _source: { inStock: true, sku: 'A', facetIds: ['1', '2'] } },
+        ];
+        const { upsertIds, deleteIds } = diffProductDocuments(built, current);
+        expect(upsertIds).toEqual(['1_11_en']);
+        expect(deleteIds).toEqual([]);
+    });
+
+    it('deletes an indexed document that no longer exists in the built set', () => {
+        const current: IndexedDocument[] = [
+            { _id: '1_10_en', _source: { inStock: true, sku: 'A', facetIds: ['1', '2'] } },
+            { _id: '1_11_en', _source: { inStock: false, sku: 'B', facetIds: [] } },
+            { _id: '1_12_en', _source: { inStock: true, sku: 'C', facetIds: [] } },
+        ];
+        const { upsertIds, deleteIds } = diffProductDocuments(built, current);
+        expect(upsertIds).toEqual([]);
+        expect(deleteIds).toEqual(['1_12_en']);
+    });
+
+    it('flags a stock-derived custom-field change (the onStockStatusChange correctness invariant)', () => {
+        const builtWithCustom = new Map<string, unknown>([
             ['1_10_en', { inStock: true, 'product-stockCount': 5 }],
         ]);
-        const hits = [{ _id: '1_10_en', _source: { inStock: true, 'product-stockCount': 4 } }];
-        expect(indexedDocumentsMatch(targetWithCustom, hits)).toBe(false);
+        const current: IndexedDocument[] = [
+            { _id: '1_10_en', _source: { inStock: true, 'product-stockCount': 4 } },
+        ];
+        const { upsertIds } = diffProductDocuments(builtWithCustom, current);
+        expect(upsertIds).toEqual(['1_10_en']);
     });
 
-    it('returns false when the index has an extra document (removal needed)', () => {
-        const hits = [
-            { _id: '1_10_en', _source: { inStock: true, productInStock: true, sku: 'A', facetIds: ['1', '2'] } },
-            { _id: '1_11_en', _source: { inStock: false, productInStock: true, sku: 'B', facetIds: [] } },
-            { _id: '1_12_en', _source: { inStock: true, productInStock: true, sku: 'C', facetIds: [] } },
-        ];
-        expect(indexedDocumentsMatch(target, hits)).toBe(false);
+    it('upserts everything when the index is empty', () => {
+        const { upsertIds, deleteIds } = diffProductDocuments(built, []);
+        expect(new Set(upsertIds)).toEqual(new Set(['1_10_en', '1_11_en']));
+        expect(deleteIds).toEqual([]);
     });
 
-    it('returns false when a target document is missing from the index (needs creating)', () => {
-        const hits = [
-            { _id: '1_10_en', _source: { inStock: true, productInStock: true, sku: 'A', facetIds: ['1', '2'] } },
+    it('deletes everything when the built set is empty (product removed)', () => {
+        const current: IndexedDocument[] = [
+            { _id: '1_10_en', _source: { inStock: true } },
+            { _id: '1_11_en', _source: { inStock: false } },
         ];
-        expect(indexedDocumentsMatch(target, hits)).toBe(false);
-    });
-
-    it('returns false when an indexed id is not in the target set', () => {
-        const hits = [
-            { _id: '1_10_en', _source: { inStock: true, productInStock: true, sku: 'A', facetIds: ['1', '2'] } },
-            { _id: '9_99_en', _source: { inStock: false, productInStock: true, sku: 'B', facetIds: [] } },
-        ];
-        expect(indexedDocumentsMatch(target, hits)).toBe(false);
+        const { upsertIds, deleteIds } = diffProductDocuments(new Map(), current);
+        expect(upsertIds).toEqual([]);
+        expect(new Set(deleteIds)).toEqual(new Set(['1_10_en', '1_11_en']));
     });
 });

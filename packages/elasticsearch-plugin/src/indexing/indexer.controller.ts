@@ -46,8 +46,15 @@ import {
     VariantIndexItem,
 } from '../types';
 
-import { indexedDocumentsMatch, targetDocumentsById } from './index-diff';
+import { diffProductDocuments, IndexedDocument } from './index-diff';
 import { createIndices, getIndexNameByAlias } from './indexing-utils';
+
+/**
+ * Elasticsearch's default `index.max_result_window`. A `search` returns at most this many hits, so
+ * a plain `_source` read of a product's documents that reaches this count may be truncated. We treat
+ * that as "cannot compare reliably" and fall back to a full write rather than risk a silent skip.
+ */
+const INDEX_MAX_RESULT_WINDOW = 10000;
 
 export const defaultProductRelations: Array<EntityRelationPaths<Product>> = [
     'featuredAsset',
@@ -197,11 +204,19 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
     /**
      * Pre-enqueue guard for stock movements: returns `true` if the movement would change a
      * product's indexed `inStock`/`productInStock` (so the caller should enqueue an update),
-     * `false` if not. Only active for `reindexOnStockMovement: 'onStockStatusChange'`; otherwise
-     * always `true`. Any evaluation failure returns `true` (the safe default).
+     * `false` if it provably would not. Only active for `reindexOnStockMovement:
+     * 'onStockStatusChange'`; otherwise always `true`.
+     *
+     * The check inspects only the built-in stock booleans, so it is applied only when no custom
+     * product or variant mapping is configured. When one is, a custom field could derive from stock
+     * and change without an `inStock` flip, so we fall back to enqueuing. Any evaluation failure
+     * also returns `true` (the safe default).
      */
     async stockMovementWouldChangeIndex(ctx: RequestContext, variants: ProductVariant[]): Promise<boolean> {
         if (this.options.reindexOnStockMovement !== 'onStockStatusChange') {
+            return true;
+        }
+        if (this.hasStockDerivableCustomMappings()) {
             return true;
         }
         try {
@@ -223,9 +238,24 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
     }
 
     /**
+     * Whether any custom product or variant mapping is configured. When one is, a custom field may
+     * derive from stock levels, so the stock-booleans-only pre-enqueue guard is not safe to apply
+     * and {@link stockMovementWouldChangeIndex} falls back to always enqueuing.
+     */
+    private hasStockDerivableCustomMappings(): boolean {
+        return (
+            Object.keys(this.options.customProductMappings ?? {}).length > 0 ||
+            Object.keys(this.options.customProductVariantMappings ?? {}).length > 0
+        );
+    }
+
+    /**
      * Recomputes a product's per-channel stock booleans and compares them to what is currently
-     * indexed. Returns `true` if any variant `inStock` or the product `productInStock` differs, or
-     * if the product is not indexed yet.
+     * indexed. Returns `true` if any variant `inStock` or the product `productInStock` differs, if
+     * the product is not indexed yet, or if the indexed document set may have been truncated. The
+     * recomputation mirrors {@link forEachProductVariantDocument}: soft-deleted variants are
+     * excluded and, when the product is disabled, all variants are treated as disabled, so it stays
+     * consistent with {@link createVariantIndexItem}.
      */
     private async productStockStatusDiffersFromIndex(
         ctx: MutableRequestContext,
@@ -236,12 +266,17 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
             body: {
                 query: { term: { productId } },
                 _source: ['channelId', 'productVariantId', 'inStock', 'productInStock'],
-                size: 10000,
+                size: INDEX_MAX_RESULT_WINDOW,
             },
         });
         const hits = (result.body.hits?.hits ?? []) as Array<{ _source: any }>;
         if (hits.length === 0) {
             // Not indexed yet; enqueue so the document gets created.
+            return true;
+        }
+        if (hits.length >= INDEX_MAX_RESULT_WINDOW) {
+            // The read may have been truncated at the result window, so we cannot be sure we saw
+            // every indexed document. Enqueue rather than risk skipping a real change.
             return true;
         }
         const product = await this.connection.getRepository(ctx, Product).findOne({
@@ -250,6 +285,12 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
         });
         if (!product) {
             return true;
+        }
+        // Mirror the builder: drop soft-deleted variants, and when the product is disabled treat
+        // every variant as disabled (which is what determines productInStock).
+        const liveVariants = product.variants.filter(v => v.deletedAt == null);
+        if (!product.enabled) {
+            liveVariants.forEach(v => (v.enabled = false));
         }
         const indexedByChannel = new Map<
             string,
@@ -273,13 +314,12 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
                     continue;
                 }
                 ctx.setChannel(channel);
-                const variantsInChannel = product.variants.filter(v =>
+                const variantsInChannel = liveVariants.filter(v =>
                     v.channels.map(c => c.id).includes(channel.id),
                 );
                 const currentInStockByVariant = new Map<string, boolean>();
                 for (const variant of variantsInChannel) {
-                    const saleable = await this.productVariantService.getSaleableStockLevel(ctx, variant);
-                    currentInStockByVariant.set(String(variant.id), 0 < saleable);
+                    currentInStockByVariant.set(String(variant.id), await this.computeVariantInStock(ctx, variant));
                 }
                 const currentProductInStock = await this.getProductInStockValue(ctx, variantsInChannel);
                 for (const doc of channelDocs) {
@@ -606,16 +646,16 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
     }
 
     /**
-     * Builds (but does not execute) the upsert operations for a single product's variant
-     * documents. Split out from {@link updateProductsOperationsOnly} so the incremental update
-     * path can build the target documents, compare them against what is currently indexed, and
-     * skip the write entirely when nothing changed (see `skipUnchangedIndexUpdates`).
+     * Builds each of a product's variant documents and passes it to `visit` as an `(id, document)`
+     * pair. Kept as a visitor so callers can either stream the resulting operations (the reindex and
+     * opt-out paths) or collect the documents to diff them against the index (the incremental path),
+     * without either path having to buffer a large product's whole document set at build time.
      */
-    private async buildProductVariantOperations(
+    private async forEachProductVariantDocument(
         ctx: MutableRequestContext,
         productId: ID,
-    ): Promise<BulkVariantOperation[]> {
-        const operations: BulkVariantOperation[] = [];
+        visit: (id: string, document: VariantIndexItem) => void | Promise<void>,
+    ): Promise<void> {
         let product: Product | undefined;
         try {
             product = await this.connection
@@ -630,7 +670,7 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
             throw e;
         }
         if (!product) {
-            return [];
+            return;
         }
         let updatedProductVariants: ProductVariant[] = [];
         try {
@@ -662,72 +702,106 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
 
         const uniqueLanguageVariants = unique(languageVariants);
         const originalChannel = ctx.channel;
-        for (const channel of product.channels) {
-            ctx.setChannel(channel);
-            const variantsInChannel = updatedProductVariants.filter(v =>
-                v.channels.map(c => c.id).includes(ctx.channelId),
-            );
-            for (const variant of variantsInChannel)
-                await this.productPriceApplicator.applyChannelPriceAndTax(variant, ctx);
+        try {
+            for (const channel of product.channels) {
+                ctx.setChannel(channel);
+                const variantsInChannel = updatedProductVariants.filter(v =>
+                    v.channels.map(c => c.id).includes(ctx.channelId),
+                );
+                for (const variant of variantsInChannel)
+                    await this.productPriceApplicator.applyChannelPriceAndTax(variant, ctx);
 
-            for (const languageCode of uniqueLanguageVariants) {
-                if (variantsInChannel.length) {
-                    for (const variant of variantsInChannel) {
-                        operations.push(
-                            {
-                                index: VARIANT_INDEX_NAME,
-                                operation: {
-                                    update: {
-                                        _id: ElasticsearchIndexerController.getId(
-                                            variant.id,
-                                            ctx.channelId,
-                                            languageCode,
-                                        ),
-                                    },
-                                },
-                            },
-                            {
-                                index: VARIANT_INDEX_NAME,
-                                operation: {
-                                    doc: await this.createVariantIndexItem(
-                                        variant,
-                                        variantsInChannel,
-                                        ctx,
-                                        languageCode,
-                                    ),
-                                    doc_as_upsert: true,
-                                },
-                            },
+                for (const languageCode of uniqueLanguageVariants) {
+                    if (variantsInChannel.length) {
+                        for (const variant of variantsInChannel) {
+                            const id = ElasticsearchIndexerController.getId(
+                                variant.id,
+                                ctx.channelId,
+                                languageCode,
+                            );
+                            await visit(
+                                id,
+                                await this.createVariantIndexItem(variant, variantsInChannel, ctx, languageCode),
+                            );
+                        }
+                    } else {
+                        const id = ElasticsearchIndexerController.getId(
+                            -product.id,
+                            ctx.channelId,
+                            languageCode,
                         );
+                        await visit(id, await this.createSyntheticProductIndexItem(product, ctx, languageCode));
                     }
-                } else {
-                    operations.push(
-                        {
-                            index: VARIANT_INDEX_NAME,
-                            operation: {
-                                update: {
-                                    _id: ElasticsearchIndexerController.getId(
-                                        -product.id,
-                                        ctx.channelId,
-                                        languageCode,
-                                    ),
-                                },
-                            },
-                        },
-                        {
-                            index: VARIANT_INDEX_NAME,
-                            operation: {
-                                doc: await this.createSyntheticProductIndexItem(product, ctx, languageCode),
-                                doc_as_upsert: true,
-                            },
-                        },
-                    );
                 }
             }
+        } finally {
+            ctx.setChannel(originalChannel);
         }
-        ctx.setChannel(originalChannel);
+    }
 
-        return operations;
+    /**
+     * The pair of bulk operations that write a single built document. Uses the `index` action (a
+     * full-document replace keyed by `_id`) rather than a partial `update`, so a field that is no
+     * longer present in the freshly built document is cleared instead of lingering from a previous
+     * version. Because it replaces the document in place, it never removes it first, so the product
+     * does not drop out of search the way the previous delete-then-recreate did.
+     */
+    private documentToOperations(id: string, document: VariantIndexItem): BulkVariantOperation[] {
+        return [
+            { index: VARIANT_INDEX_NAME, operation: { index: { _id: id } } },
+            { index: VARIANT_INDEX_NAME, operation: document },
+        ];
+    }
+
+    /**
+     * Streams a product's upsert operations to the index in chunks, without holding all of a large
+     * product's documents in memory. Used by the full reindex, the opt-out path, and the fallback
+     * for products too large to diff.
+     */
+    private async streamProductVariantOperations(
+        ctx: MutableRequestContext,
+        productId: ID,
+        index = VARIANT_INDEX_NAME,
+    ): Promise<void> {
+        const chunkSize = this.options.reindexBulkOperationSizeLimit;
+        let buffer: BulkVariantOperation[] = [];
+        await this.forEachProductVariantDocument(ctx, productId, async (id, document) => {
+            buffer.push(...this.documentToOperations(id, document));
+            // Because a product can have a huge number of variants, flush as we go rather than
+            // buffering the whole product before writing.
+            if (buffer.length >= chunkSize) {
+                await this.executeBulkOperationsByChunks(chunkSize, buffer, index);
+                buffer = [];
+            }
+        });
+        if (buffer.length) {
+            await this.executeBulkOperationsByChunks(chunkSize, buffer, index);
+        }
+    }
+
+    /**
+     * Builds all of a product's documents into a map keyed by document id, for diffing against the
+     * index. Returns `null` when the product has more than `maxDocuments` documents, signalling the
+     * caller to fall back to the streaming path rather than buffer an unbounded amount in memory.
+     */
+    private async buildProductVariantDocuments(
+        ctx: MutableRequestContext,
+        productId: ID,
+        maxDocuments: number,
+    ): Promise<Map<string, VariantIndexItem> | null> {
+        const documentsById = new Map<string, VariantIndexItem>();
+        let overflowed = false;
+        await this.forEachProductVariantDocument(ctx, productId, (id, document) => {
+            if (overflowed) {
+                return;
+            }
+            documentsById.set(id, document);
+            if (documentsById.size > maxDocuments) {
+                overflowed = true;
+                documentsById.clear();
+            }
+        });
+        return overflowed ? null : documentsById;
     }
 
     private async updateProductsOperationsOnly(
@@ -735,76 +809,85 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
         productId: ID,
         index = VARIANT_INDEX_NAME,
     ): Promise<void> {
-        const operations = await this.buildProductVariantOperations(ctx, productId);
-        // Because we can have a huge amount of variants for 1 product, we chunk update operations
-        await this.executeBulkOperationsByChunks(
-            this.options.reindexBulkOperationSizeLimit,
-            operations,
-            index,
-        );
+        await this.streamProductVariantOperations(ctx, productId, index);
     }
 
     private async updateProductsOperations(ctx: MutableRequestContext, productIds: ID[]): Promise<void> {
         Logger.debug(`Updating ${productIds.length} Products`, loggerCtx);
         for (const productId of productIds) {
-            if (this.options.skipUnchangedIndexUpdates) {
-                // Skip both the delete and the recreate when the built documents match what is
-                // already indexed (avoids a redundant write and the delete-then-recreate flicker).
-                const operations = await this.buildProductVariantOperations(ctx, productId);
-                if (await this.isProductIndexUnchanged(ctx, productId, operations)) {
-                    Logger.debug(
-                        `Skipping reindex of product ${productId}: indexed documents unchanged`,
-                        loggerCtx,
-                    );
-                    continue;
-                }
-                await this.deleteProductOperations(ctx, productId);
-                await this.executeBulkOperationsByChunks(
-                    this.options.reindexBulkOperationSizeLimit,
-                    operations,
-                );
-            } else {
+            if (!this.options.incrementalIndexUpdates) {
+                // Opt-out: reproduce the historic delete-then-recreate behaviour.
                 await this.deleteProductOperations(ctx, productId);
                 await this.updateProductsOperationsOnly(ctx, productId);
+                continue;
             }
+            await this.incrementalUpdateProduct(ctx, productId);
         }
-        return;
     }
 
     /**
-     * Returns `true` when a product's freshly-built documents are identical to what is currently
-     * indexed (same ids and content). Any read failure returns `false` (write, the safe default).
+     * Incrementally reconciles a single product's documents with the index: upserts the documents
+     * that are new or changed, deletes the documents that no longer exist, and writes nothing when
+     * everything already matches. It never removes a still-current document, so the product does not
+     * drop out of search during the update. Falls back to the streaming delete-then-recreate path
+     * when the product is too large to diff safely.
      */
-    private async isProductIndexUnchanged(
-        ctx: RequestContext,
-        productId: ID,
-        operations: BulkVariantOperation[],
-    ): Promise<boolean> {
-        const targetById = targetDocumentsById(operations);
-        if (targetById.size === 0) {
-            // Nothing to index for this product; let the normal path handle it.
-            return false;
+    private async incrementalUpdateProduct(ctx: MutableRequestContext, productId: ID): Promise<void> {
+        const builtById = await this.buildProductVariantDocuments(ctx, productId, INDEX_MAX_RESULT_WINDOW);
+        const currentDocuments = builtById === null ? null : await this.readCurrentProductDocuments(productId);
+        if (builtById === null || currentDocuments === null) {
+            // Too large to diff reliably, or the index read failed; fall back to the streaming path.
+            await this.deleteProductOperations(ctx, productId);
+            await this.updateProductsOperationsOnly(ctx, productId);
+            return;
         }
-        let currentHits: Array<{ _id: string; _source: any }>;
+        const { upsertIds, deleteIds } = diffProductDocuments(builtById, currentDocuments);
+        if (upsertIds.length === 0 && deleteIds.length === 0) {
+            Logger.debug(
+                `Skipping reindex of product ${productId}: indexed documents unchanged`,
+                loggerCtx,
+            );
+            return;
+        }
+        const operations: BulkVariantOperation[] = [];
+        for (const id of deleteIds) {
+            operations.push({ index: VARIANT_INDEX_NAME, operation: { delete: { _id: id } } });
+        }
+        for (const id of upsertIds) {
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+            operations.push(...this.documentToOperations(id, builtById.get(id)!));
+        }
+        await this.executeBulkOperationsByChunks(this.options.reindexBulkOperationSizeLimit, operations);
+    }
+
+    /**
+     * Reads a product's currently indexed documents (id and full `_source`). Returns `null` when the
+     * read fails or may have been truncated at the result window, so the caller falls back to a full
+     * write rather than risk a partial diff.
+     */
+    private async readCurrentProductDocuments(productId: ID): Promise<IndexedDocument[] | null> {
         try {
             const result = await this.adapter.search({
                 index: this.options.indexPrefix + VARIANT_INDEX_NAME,
                 body: {
                     // productId is a keyword, so this term matches every document for the product.
                     query: { term: { productId } },
-                    size: 10000,
+                    size: INDEX_MAX_RESULT_WINDOW,
                     _source: true,
                 },
             });
-            currentHits = result.body.hits?.hits ?? [];
+            const hits = (result.body.hits?.hits ?? []) as IndexedDocument[];
+            if (hits.length >= INDEX_MAX_RESULT_WINDOW) {
+                return null;
+            }
+            return hits;
         } catch (e: any) {
             Logger.warn(
                 `Could not read current index state for product ${productId}, will write: ${e.message}`,
                 loggerCtx,
             );
-            return false;
+            return null;
         }
-        return indexedDocumentsMatch(targetById, currentHits);
     }
 
     /**
@@ -1098,7 +1181,7 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
                 ),
                 productCollectionSlugs: unique(productCollectionTranslations.map(c => c.slug)),
                 productChannelIds: v.product.channels.map(c => c.id),
-                inStock: 0 < (await this.productVariantService.getSaleableStockLevel(ctx, v)),
+                inStock: await this.computeVariantInStock(ctx, v),
                 productInStock: await this.getProductInStockValue(ctx, variants),
             };
             const variantCustomMappings = Object.entries(this.options.customProductVariantMappings);
@@ -1121,6 +1204,14 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
             Logger.error(err.toString());
             throw Error('Error while reindexing!');
         }
+    }
+
+    /**
+     * A variant's indexed `inStock` value. Shared by {@link createVariantIndexItem} and the
+     * pre-enqueue stock guard so the two cannot compute it differently.
+     */
+    private async computeVariantInStock(ctx: RequestContext, variant: ProductVariant): Promise<boolean> {
+        return 0 < (await this.productVariantService.getSaleableStockLevel(ctx, variant));
     }
 
     private async getProductInStockValue(ctx: RequestContext, variants: ProductVariant[]): Promise<boolean> {

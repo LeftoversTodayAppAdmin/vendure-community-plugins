@@ -16,6 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
 import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
+import { VARIANT_INDEX_NAME } from '../src/constants';
 import { ElasticsearchPlugin } from '../src/plugin';
 
 import { awaitRunningJobs } from './await-running-jobs';
@@ -95,7 +96,7 @@ describe(`Elasticsearch plugin [${searchBackend as string}]`, () => {
                 ElasticsearchPlugin.init({
                     indexPrefix: INDEX_PREFIX,
                     adapter: buildAdapterForBackend(),
-                    skipUnchangedIndexUpdates: true,
+                    incrementalIndexUpdates: true,
                     hydrateProductVariantRelations: ['customFields.material', 'stockLevels'],
                     customProductVariantMappings: {
                         inStock: {
@@ -1700,37 +1701,68 @@ describe(`Elasticsearch plugin [${searchBackend as string}]`, () => {
         });
     });
 
-    // The whole suite runs with skipUnchangedIndexUpdates enabled (see the plugin config above),
-    // so every existing test already exercises the guard on real updates. These add explicit
-    // stock-movement cases: a non-boundary movement must leave search correct, and a movement
-    // that flips inStock must be reflected.
-    describe('skipUnchangedIndexUpdates', () => {
-        async function inStockVariantIds(inStock: boolean): Promise<string[]> {
-            const result = await shopClient.query(searchProductsShopDocument, {
-                input: { groupByProduct: false, inStock, take: 200 },
-            });
-            return result.search.items.map(i => i.productVariantId);
-        }
-
+    // The whole suite runs with incrementalIndexUpdates enabled, which is the default, so every
+    // existing test already exercises the incremental write path. These add explicit checks that a
+    // redundant update writes nothing, that a real change is still written, and that stock movements
+    // are reflected. Because this config also defines a stock-derived custom mapping (`inStock`),
+    // `reindexOnStockMovement: 'onStockStatusChange'` would self-disable here; the pre-enqueue guard
+    // is covered separately in the stock-guard spec, which has no custom mappings.
+    describe('incrementalIndexUpdates', () => {
+        const rawAdapter = buildAdapterForBackend()();
         let variantId: string;
 
-        it('finds an in-stock variant to exercise', async () => {
-            const ids = await inStockVariantIds(true);
+        // Read a single variant's indexed document directly, so assertions are exact and do not
+        // depend on paging through the search results (which silently truncates as the fixture grows).
+        async function indexedVariantDoc(
+            productVariantId: string,
+        ): Promise<{ source: any; version: number } | undefined> {
+            await rawAdapter.indices.refresh({ index: INDEX_PREFIX + VARIANT_INDEX_NAME });
+            const result = await rawAdapter.search({
+                index: INDEX_PREFIX + VARIANT_INDEX_NAME,
+                body: { query: { term: { productVariantId } }, version: true } as any,
+            });
+            const hit = (result.body.hits.hits as any[])[0];
+            return hit ? { source: hit._source, version: hit._version } : undefined;
+        }
+
+        beforeAll(async () => {
+            const result = await shopClient.query(searchProductsShopDocument, {
+                input: { groupByProduct: false, inStock: true, sort: { name: SortOrder.ASC } },
+            });
+            const ids = result.search.items.map(i => i.productVariantId);
             expect(ids.length).toBeGreaterThan(0);
             variantId = ids[0];
+            // Start from a known in-stock quantity so the cases below are deterministic.
+            await adminClient.query(updateProductVariantsDocument, {
+                input: [{ id: variantId, trackInventory: GlobalFlag.TRUE, stockOnHand: 50 }],
+            });
+            await awaitRunningJobs(adminClient);
         });
 
-        it('keeps search correct after a non-boundary stock movement', async () => {
+        it('does not rewrite the document when an update produces no change', async () => {
+            const before = await indexedVariantDoc(variantId);
+            expect(before).toBeDefined();
+            // Re-apply the identical values: the update-variants job runs, but the freshly built
+            // document is identical to what is indexed, so nothing should be written.
             await adminClient.query(updateProductVariantsDocument, {
-                input: [{ id: variantId, trackInventory: GlobalFlag.TRUE, stockOnHand: 100 }],
+                input: [{ id: variantId, trackInventory: GlobalFlag.TRUE, stockOnHand: 50 }],
             });
             await awaitRunningJobs(adminClient);
+            const after = await indexedVariantDoc(variantId);
+            // A write (delete-then-recreate or replace) would bump the document version.
+            expect(after!.version).toBe(before!.version);
+            expect(after!.source.inStock).toBe(true);
+        });
+
+        it('writes the document when a real change occurs', async () => {
+            const before = await indexedVariantDoc(variantId);
             await adminClient.query(updateProductVariantsDocument, {
-                input: [{ id: variantId, trackInventory: GlobalFlag.TRUE, stockOnHand: 99 }],
+                input: [{ id: variantId, price: 999_99 }],
             });
             await awaitRunningJobs(adminClient);
-            expect(await inStockVariantIds(true)).toContain(variantId);
-            expect(await inStockVariantIds(false)).not.toContain(variantId);
+            const after = await indexedVariantDoc(variantId);
+            expect(after!.version).toBeGreaterThan(before!.version);
+            expect(after!.source.price).toBe(999_99);
         });
 
         it('reflects a stock movement that flips the variant out of stock', async () => {
@@ -1738,8 +1770,7 @@ describe(`Elasticsearch plugin [${searchBackend as string}]`, () => {
                 input: [{ id: variantId, trackInventory: GlobalFlag.TRUE, stockOnHand: 0 }],
             });
             await awaitRunningJobs(adminClient);
-            expect(await inStockVariantIds(true)).not.toContain(variantId);
-            expect(await inStockVariantIds(false)).toContain(variantId);
+            expect((await indexedVariantDoc(variantId))!.source.inStock).toBe(false);
         });
 
         it('reflects a stock movement that flips the variant back in stock', async () => {
@@ -1747,8 +1778,7 @@ describe(`Elasticsearch plugin [${searchBackend as string}]`, () => {
                 input: [{ id: variantId, trackInventory: GlobalFlag.TRUE, stockOnHand: 50 }],
             });
             await awaitRunningJobs(adminClient);
-            expect(await inStockVariantIds(true)).toContain(variantId);
-            expect(await inStockVariantIds(false)).not.toContain(variantId);
+            expect((await indexedVariantDoc(variantId))!.source.inStock).toBe(true);
         });
     });
 });
