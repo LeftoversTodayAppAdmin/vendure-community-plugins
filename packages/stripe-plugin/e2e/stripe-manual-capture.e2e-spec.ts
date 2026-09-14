@@ -248,4 +248,20 @@ describe('Stripe manual capture', () => {
             expect(voided.payments?.some(p => p.state === 'Settled')).not.toBe(true);
         });
     });
+
+    describe('webhook resilience', () => {
+        it('returns 5xx on an unexpected error so Stripe redelivers the event', async () => {
+            // An order that cannot be found is an unexpected/transient condition (for example
+            // replication lag), so the handler must not swallow it with a 200. A 5xx lets Stripe
+            // retry, and the idempotency guard makes the eventual redelivery safe.
+            const status = await postWebhook(
+                serverPort,
+                amountCapturableUpdatedEvent(
+                    { code: 'NON_EXISTENT_ORDER', id: 'T_999999', totalWithTax: 1000 } as any,
+                    'pi_unknown_order',
+                ),
+            );
+            expect(status).toBeGreaterThanOrEqual(500);
+        });
+    });
 });

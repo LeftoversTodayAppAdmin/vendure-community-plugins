@@ -256,15 +256,18 @@ export class StripeController {
                 }
             });
         } catch (e: any) {
-            // A throw here (for example insufficient stock during the PaymentAuthorized transition)
-            // has rolled back the transaction. With manual capture the external authorization is
-            // still held, so it must be voided below.
+            // An unexpected/transient error (for example a database issue) rolled back the
+            // transaction. Respond with a 5xx so Stripe redelivers the event and we get another
+            // chance to process it; the idempotency guard above makes redelivery safe. We do not void
+            // here on purpose: a transient failure must not discard a valid authorization. Genuine
+            // "cannot arrange the order" outcomes are handled deterministically above (they void and
+            // return 200), so they are not retried.
             Logger.error(
                 `Error processing Stripe webhook for order ${orderCode}: ${(e as Error)?.message}`,
                 loggerCtx,
             );
-            if (isManualCapture) {
-                shouldVoidAuthorization = true;
+            if (!response.headersSent) {
+                response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('Error processing webhook');
             }
         }
 

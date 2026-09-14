@@ -165,6 +165,12 @@ Add it to your Stripe webhook endpoint alongside `payment_intent.succeeded` and
 not all (for example bank debits). Setting `captureMethod: 'manual'` restricts the PaymentIntent to
 eligible methods. See the Stripe documentation linked above for the current list.
 
+**Reliability:** the webhook handler is idempotent (a redelivered event for an already recorded payment
+is skipped) and returns a `5xx` on an unexpected/transient error so Stripe redelivers the event, rather
+than silently dropping it. A deterministic outcome, such as the item having sold out, is handled once
+(the hold is voided) and acknowledged with a `2xx`. Outgoing calls to Stripe (authorize, capture, void)
+use the SDK's idempotent network retries.
+
 ## Local Development
 
 1. Download & install the Stripe CLI: https://stripe.com/docs/stripe-cli
