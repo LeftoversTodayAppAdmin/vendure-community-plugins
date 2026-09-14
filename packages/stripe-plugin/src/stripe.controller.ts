@@ -7,6 +7,7 @@ import {
     Logger,
     Order,
     OrderService,
+    Payment,
     PaymentMethodService,
     RequestContextService,
     TransactionalConnection,
@@ -74,106 +75,215 @@ export class StripeController {
         const { channelToken, orderCode, orderId, languageCode } = metadata;
 
         const outerCtx = await this.createContext(channelToken, languageCode, request);
+        const isManualCapture = this.stripeService.isManualCapture();
+        // With manual capture the authorization arrives as `amount_capturable_updated` (funds held,
+        // status `requires_capture`); with automatic capture the funds are already charged and the
+        // event is `succeeded`.
+        const authorizationEventType = isManualCapture
+            ? 'payment_intent.amount_capturable_updated'
+            : 'payment_intent.succeeded';
 
-        await this.connection.withTransaction(outerCtx, async (ctx: RequestContext) => {
-            const order = await this.orderService.findOneByCode(ctx, orderCode);
+        // Set when an authorization was placed but the order could not be arranged (for example the
+        // item sold out). The hold is released after the transaction settles/rolls back.
+        let orderForVoid: Order | undefined;
+        let shouldVoidAuthorization = false;
 
-            if (!order) {
-                throw new Error(
-                    `Unable to find order ${orderCode}, unable to settle payment ${paymentIntent.id}!`,
-                );
-            }
+        try {
+            await this.connection.withTransaction(outerCtx, async (ctx: RequestContext) => {
+                const order = await this.orderService.findOneByCode(ctx, orderCode);
 
-            try {
-                // Throws an error if the signature is invalid
-                await this.stripeService.constructEventFromPayload(ctx, order, request.rawBody, signature);
-            } catch (e: any) {
-                Logger.error(`${signatureErrorMessage} ${signature}: ${(e as Error)?.message}`, loggerCtx);
-                response.status(HttpStatus.BAD_REQUEST).send(signatureErrorMessage);
-                return;
-            }
-
-            if (event.type === 'payment_intent.payment_failed') {
-                const message = paymentIntent.last_payment_error?.message ?? 'unknown error';
-                Logger.warn(`Payment for order ${orderCode} failed: ${message}`, loggerCtx);
-                response.status(HttpStatus.OK).send('Ok');
-                return;
-            }
-
-            if (event.type !== 'payment_intent.succeeded') {
-                // This should never happen as the webhook is configured to receive
-                // payment_intent.succeeded and payment_intent.payment_failed events only
-                Logger.info(`Received ${event.type} status update for order ${orderCode}`, loggerCtx);
-                return;
-            }
-
-            if (order.state !== 'ArrangingPayment' && order.state !== 'ArrangingAdditionalPayment') {
-                // The stripe plugin based on https://github.com/vendurehq/vendure/pull/3624 can export the
-                // StripeService to support additional payment flows where state can be ArrangingAdditionalPayment.
-
-                // Orders can switch channels (e.g., global to UK store), causing lookups by the original
-                // channel to fail. Using a default channel avoids "entity-with-id-not-found" errors.
-                // See https://github.com/vendurehq/vendure/issues/3072
-
-                // First use the channel specific context to transition the order state, which is the default behavior
-                // prior to issue: https://github.com/vendurehq/vendure/issues/3072
-                let transitionToStateResult = await this.orderService.transitionToState(
-                    ctx,
-                    orderId,
-                    'ArrangingPayment',
-                );
-
-                // If the channel specific context fails, try to use the default channel context
-                // to transition the order state. Issue: https://github.com/vendurehq/vendure/issues/3072
-                if (transitionToStateResult instanceof OrderStateTransitionError) {
-                    const defaultChannel = await this.channelService.getDefaultChannel(ctx);
-                    const ctxWithDefaultChannel = await this.createContext(
-                        defaultChannel.token,
-                        languageCode,
-                        request,
-                    );
-
-                    transitionToStateResult = await this.orderService.transitionToState(
-                        ctxWithDefaultChannel,
-                        orderId,
-                        'ArrangingPayment',
+                if (!order) {
+                    throw new Error(
+                        `Unable to find order ${orderCode}, unable to settle payment ${paymentIntent.id}!`,
                     );
                 }
+                orderForVoid = order;
 
-                // If the order is still not in the ArrangingPayment state, log an error
-                if (transitionToStateResult instanceof OrderStateTransitionError) {
-                    Logger.error(
-                        `Error transitioning order ${orderCode} to ArrangingPayment state: ${transitionToStateResult.message}`,
+                try {
+                    // Throws an error if the signature is invalid
+                    await this.stripeService.constructEventFromPayload(ctx, order, request.rawBody, signature);
+                } catch (e: any) {
+                    Logger.error(`${signatureErrorMessage} ${signature}: ${(e as Error)?.message}`, loggerCtx);
+                    response.status(HttpStatus.BAD_REQUEST).send(signatureErrorMessage);
+                    return;
+                }
+
+                if (event.type === 'payment_intent.payment_failed') {
+                    const message = paymentIntent.last_payment_error?.message ?? 'unknown error';
+                    Logger.warn(`Payment for order ${orderCode} failed: ${message}`, loggerCtx);
+                    response.status(HttpStatus.OK).send('Ok');
+                    return;
+                }
+
+                // In manual-capture mode `succeeded` fires after the plugin captures and `canceled`
+                // after it voids, so both merely confirm an action already taken here.
+                if (isManualCapture && event.type === 'payment_intent.succeeded') {
+                    Logger.info(`Capture confirmed for order ${orderCode} (${paymentIntent.id})`, loggerCtx);
+                    return;
+                }
+                if (isManualCapture && event.type === 'payment_intent.canceled') {
+                    Logger.info(`Authorization voided for order ${orderCode} (${paymentIntent.id})`, loggerCtx);
+                    return;
+                }
+
+                if (event.type !== authorizationEventType) {
+                    // The webhook should be configured to send only the events handled above, so
+                    // anything else is unexpected and safely ignored.
+                    Logger.info(`Received ${event.type} status update for order ${orderCode}`, loggerCtx);
+                    return;
+                }
+
+                // Idempotency: a repeated authorization webhook must not add a second payment or void
+                // a valid one, so do nothing if this intent is already recorded on an order.
+                const existingPayment = await this.connection.getRepository(ctx, Payment).findOne({
+                    where: { transactionId: paymentIntent.id },
+                });
+                if (existingPayment) {
+                    Logger.info(
+                        `Payment for intent ${paymentIntent.id} already recorded, skipping order ${orderCode}`,
                         loggerCtx,
                     );
                     return;
                 }
-            }
 
-            const paymentMethod = await this.getPaymentMethod(ctx);
+                if (order.state !== 'ArrangingPayment' && order.state !== 'ArrangingAdditionalPayment') {
+                    // The stripe plugin based on https://github.com/vendurehq/vendure/pull/3624 can export the
+                    // StripeService to support additional payment flows where state can be ArrangingAdditionalPayment.
 
-            const addPaymentToOrderResult = await this.orderService.addPaymentToOrder(ctx, orderId, {
-                method: paymentMethod.code,
-                metadata: {
-                    paymentIntentAmountReceived: paymentIntent.amount_received,
-                    paymentIntentId: paymentIntent.id,
-                },
-            });
+                    // Orders can switch channels (e.g., global to UK store), causing lookups by the original
+                    // channel to fail. Using a default channel avoids "entity-with-id-not-found" errors.
+                    // See https://github.com/vendurehq/vendure/issues/3072
 
-            if (!(addPaymentToOrderResult instanceof Order)) {
-                Logger.error(
-                    `Error adding payment to order ${orderCode}: ${addPaymentToOrderResult.message}`,
+                    // First use the channel specific context to transition the order state, which is the default behavior
+                    // prior to issue: https://github.com/vendurehq/vendure/issues/3072
+                    let transitionToStateResult = await this.orderService.transitionToState(
+                        ctx,
+                        orderId,
+                        'ArrangingPayment',
+                    );
+
+                    // If the channel specific context fails, try to use the default channel context
+                    // to transition the order state. Issue: https://github.com/vendurehq/vendure/issues/3072
+                    if (transitionToStateResult instanceof OrderStateTransitionError) {
+                        const defaultChannel = await this.channelService.getDefaultChannel(ctx);
+                        const ctxWithDefaultChannel = await this.createContext(
+                            defaultChannel.token,
+                            languageCode,
+                            request,
+                        );
+
+                        transitionToStateResult = await this.orderService.transitionToState(
+                            ctxWithDefaultChannel,
+                            orderId,
+                            'ArrangingPayment',
+                        );
+                    }
+
+                    // If the order is still not in the ArrangingPayment state, it cannot be paid. The
+                    // default order process blocks this transition when the order is no longer
+                    // saleable (backorder-aware, via `arrangingPaymentRequiresStock`), among other
+                    // preconditions, so this is the point at which "the item sold out during
+                    // checkout" surfaces. With manual capture the funds are only authorized, so we
+                    // void the hold instead of leaving the customer charged for an order that cannot
+                    // be arranged.
+                    if (transitionToStateResult instanceof OrderStateTransitionError) {
+                        Logger.error(
+                            `Error transitioning order ${orderCode} to ArrangingPayment state: ${transitionToStateResult.message}`,
+                            loggerCtx,
+                        );
+                        if (isManualCapture) {
+                            shouldVoidAuthorization = true;
+                        }
+                        return;
+                    }
+                }
+
+                const paymentMethod = await this.getPaymentMethod(ctx);
+
+                // With manual capture the funds are only authorized, so `amount_received` is still 0;
+                // record the capturable amount instead.
+                const paymentAmountReceived = isManualCapture
+                    ? paymentIntent.amount_capturable || paymentIntent.amount
+                    : paymentIntent.amount_received;
+
+                const addPaymentToOrderResult = await this.orderService.addPaymentToOrder(ctx, orderId, {
+                    method: paymentMethod.code,
+                    metadata: {
+                        paymentIntentAmountReceived: paymentAmountReceived,
+                        paymentIntentId: paymentIntent.id,
+                    },
+                });
+
+                if (!(addPaymentToOrderResult instanceof Order)) {
+                    Logger.error(
+                        `Error adding payment to order ${orderCode}: ${addPaymentToOrderResult.message}`,
+                        loggerCtx,
+                    );
+                    // Manual capture: the funds are authorized but Vendure rejected the payment (for
+                    // example the item sold out), so the hold must be released.
+                    if (isManualCapture) {
+                        shouldVoidAuthorization = true;
+                    }
+                    return;
+                }
+
+                // The payment intent ID is added to the order only if we can reach this point.
+                Logger.info(
+                    `Stripe payment intent id ${paymentIntent.id} added to order ${orderCode}`,
                     loggerCtx,
                 );
-                return;
-            }
 
-            // The payment intent ID is added to the order only if we can reach this point.
-            Logger.info(
-                `Stripe payment intent id ${paymentIntent.id} added to order ${orderCode}`,
+                if (isManualCapture) {
+                    // The order is now in PaymentAuthorized and stock has been allocated, so it is safe
+                    // to capture the held funds by settling the payment (moving it to PaymentSettled).
+                    const authorizedPayment = await this.connection.getRepository(ctx, Payment).findOne({
+                        where: { transactionId: paymentIntent.id },
+                    });
+                    if (authorizedPayment) {
+                        const settleResult = await this.orderService.settlePayment(ctx, authorizedPayment.id);
+                        if (!(settleResult instanceof Order)) {
+                            // Capture failed after a successful authorization. The order stays in
+                            // PaymentAuthorized with the funds still held, so it can be captured or
+                            // cancelled from the Admin UI. Do not void here.
+                            Logger.error(
+                                `Authorized order ${orderCode} but could not capture payment ${paymentIntent.id}: ${
+                                    'message' in settleResult ? settleResult.message : 'unknown error'
+                                }`,
+                                loggerCtx,
+                            );
+                        }
+                    }
+                }
+            });
+        } catch (e: any) {
+            // A throw here (for example insufficient stock during the PaymentAuthorized transition)
+            // has rolled back the transaction. With manual capture the external authorization is
+            // still held, so it must be voided below.
+            Logger.error(
+                `Error processing Stripe webhook for order ${orderCode}: ${(e as Error)?.message}`,
                 loggerCtx,
             );
-        });
+            if (isManualCapture) {
+                shouldVoidAuthorization = true;
+            }
+        }
+
+        if (shouldVoidAuthorization && orderForVoid) {
+            try {
+                await this.stripeService.cancelPaymentIntent(outerCtx, orderForVoid, paymentIntent.id);
+                Logger.warn(
+                    `Voided Stripe authorization ${paymentIntent.id} for order ${orderCode}: order could not be arranged`,
+                    loggerCtx,
+                );
+            } catch (e: any) {
+                Logger.error(
+                    `Failed to void Stripe authorization ${paymentIntent.id} for order ${orderCode}: ${
+                        (e as Error)?.message
+                    }`,
+                    loggerCtx,
+                );
+            }
+        }
 
         // Send the response status only if we didn't sent anything yet.
         if (!response.headersSent) {

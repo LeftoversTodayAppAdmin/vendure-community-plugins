@@ -60,24 +60,36 @@ export class StripeService {
             ...sanitizeMetadata(additionalParams?.metadata ?? {}),
         };
 
-        const { client_secret } = await stripe.paymentIntents.create(
-            {
-                amount: amountInMinorUnits,
-                currency: order.currencyCode.toLowerCase(),
-                customer: customerId,
-                automatic_payment_methods: {
-                    enabled: true,
-                },
-                ...(additionalParams ?? {}),
-                metadata: allMetadata,
+        const createParams: Stripe.PaymentIntentCreateParams = {
+            amount: amountInMinorUnits,
+            currency: order.currencyCode.toLowerCase(),
+            customer: customerId,
+            automatic_payment_methods: {
+                enabled: true,
             },
-            {
-                idempotencyKey: `${order.code}_${amountInMinorUnits}`,
-                ...(requestOptions ?? {}),
-            },
-        );
+            // Manual capture places a hold on the funds (status `requires_capture`) rather than
+            // charging immediately, so Vendure can secure stock before the money is captured.
+            ...(this.isManualCapture() ? { capture_method: 'manual' as const } : {}),
+            ...(additionalParams ?? {}),
+            metadata: allMetadata,
+        };
+        const idempotencyKey = `${order.code}_${amountInMinorUnits}`;
 
-        if (!client_secret) {
+        const paymentIntent = await stripe.paymentIntents.create(createParams, {
+            idempotencyKey,
+            ...(requestOptions ?? {}),
+        });
+
+        // In manual-capture mode an intent can be cancelled server-side (for example when a stock
+        // check fails after authorization). Because the idempotency key above replays the original
+        // response, a same-amount retry would hand back the cancelled intent's client secret, which
+        // can no longer be confirmed. Retrieve the live intent and, if it is no longer confirmable,
+        // mint a fresh one so a retry always gets a usable intent.
+        const usableIntent = this.isManualCapture()
+            ? await this.ensureConfirmableIntent(stripe, paymentIntent, createParams, idempotencyKey, requestOptions)
+            : paymentIntent;
+
+        if (!usableIntent.client_secret) {
             // This should never happen
             Logger.warn(
                 `Payment intent creation for order ${order.code} did not return client secret`,
@@ -86,7 +98,82 @@ export class StripeService {
             throw Error('Failed to create payment intent');
         }
 
-        return client_secret ?? undefined;
+        return usableIntent.client_secret;
+    }
+
+    /**
+     * Whether the plugin is configured to authorize first and capture separately
+     * (`captureMethod: 'manual'`).
+     */
+    isManualCapture(): boolean {
+        return this.options.captureMethod === 'manual';
+    }
+
+    /**
+     * Captures a previously authorized PaymentIntent, charging the held funds. Used by the payment
+     * handler's `settlePayment` in manual-capture mode.
+     */
+    async capturePaymentIntent(
+        ctx: RequestContext,
+        order: Order,
+        paymentIntentId: string,
+    ): Promise<Stripe.PaymentIntent> {
+        const stripe = await this.getStripeClient(ctx, order);
+        const requestOptions = await this.resolveRequestOptions(ctx, order);
+        return stripe.paymentIntents.capture(paymentIntentId, undefined, requestOptions);
+    }
+
+    /**
+     * Voids (cancels) a PaymentIntent, releasing any authorized hold without charging the customer.
+     * Used to release the hold when an order cannot be arranged after authorization, and by the
+     * handler's `cancelPayment`.
+     */
+    async cancelPaymentIntent(
+        ctx: RequestContext,
+        order: Order,
+        paymentIntentId: string,
+    ): Promise<Stripe.PaymentIntent> {
+        const stripe = await this.getStripeClient(ctx, order);
+        const requestOptions = await this.resolveRequestOptions(ctx, order);
+        return stripe.paymentIntents.cancel(paymentIntentId, undefined, requestOptions);
+    }
+
+    /**
+     * Returns the created intent if it can still be confirmed; otherwise creates and returns a fresh
+     * one. Used only in manual-capture mode, where the idempotency key can replay a cancelled intent
+     * whose client secret is no longer usable.
+     */
+    private async ensureConfirmableIntent(
+        stripe: VendureStripeClient,
+        createdIntent: Stripe.PaymentIntent,
+        createParams: Stripe.PaymentIntentCreateParams,
+        idempotencyKey: string,
+        requestOptions: Stripe.RequestOptions | undefined,
+    ): Promise<Stripe.PaymentIntent> {
+        let live: Stripe.PaymentIntent;
+        try {
+            live = await stripe.paymentIntents.retrieve(createdIntent.id, undefined, requestOptions);
+        } catch {
+            // If the live status cannot be read, fall back to the created intent.
+            return createdIntent;
+        }
+        if (live.client_secret && this.isConfirmableStatus(live.status)) {
+            return live;
+        }
+        // The replayed intent is no longer confirmable (e.g. cancelled). Mint a fresh one with a
+        // unique idempotency key so it is not itself a replay of the dead intent.
+        return stripe.paymentIntents.create(createParams, {
+            ...(requestOptions ?? {}),
+            idempotencyKey: `${idempotencyKey}_${Date.now()}`,
+        });
+    }
+
+    private isConfirmableStatus(status: Stripe.PaymentIntent.Status): boolean {
+        return (
+            status === 'requires_payment_method' ||
+            status === 'requires_confirmation' ||
+            status === 'requires_action'
+        );
     }
 
     async constructEventFromPayload(
