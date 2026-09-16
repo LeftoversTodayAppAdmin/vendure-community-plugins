@@ -1,6 +1,8 @@
 import { Logger } from '@vendure/core';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { MockInstance } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { loggerCtx } from './constants';
 import { ElasticsearchService } from './elasticsearch.service';
 
 interface MockAdapterHooks {
@@ -72,10 +74,17 @@ function createService(adapter: any): ElasticsearchService {
 }
 
 describe('ElasticsearchService.createIndicesIfNotExists()', () => {
+    let warnSpy: MockInstance;
+    let errorSpy: MockInstance;
+
     beforeEach(() => {
         vi.spyOn(Logger, 'verbose').mockImplementation(() => undefined);
-        vi.spyOn(Logger, 'warn').mockImplementation(() => undefined);
-        vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
+        warnSpy = vi.spyOn(Logger, 'warn').mockImplementation(() => undefined);
+        errorSpy = vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
     });
 
     describe('when the live index does not exist', () => {
@@ -86,19 +95,21 @@ describe('ElasticsearchService.createIndicesIfNotExists()', () => {
                     throw new Error('Request timed out');
                 },
             });
-            const errorSpy = vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
             const service = createService(adapter);
 
             await expect(service.createIndicesIfNotExists()).resolves.toBeUndefined();
 
-            expect(errorSpy.mock.calls.some(([msg]) => msg.includes('Could not create index'))).toBe(
-                true,
+            // `createIndices()` deliberately does not log, so this is the only place the
+            // failure is reported. Matching the exact message keeps that true.
+            expect(errorSpy).toHaveBeenCalledWith(
+                'Could not create index "test-variants": Request timed out',
+                loggerCtx,
             );
         });
     });
 
     describe('when the live index exists (drift check)', () => {
-        it('deletes the temporary index it created, using the name it was created with', async () => {
+        it('deletes the temporary index it created', async () => {
             const { adapter, created, deleted } = createMockAdapter();
             const service = createService(adapter);
 
@@ -117,14 +128,33 @@ describe('ElasticsearchService.createIndicesIfNotExists()', () => {
                     }
                 },
             });
-            const warnSpy = vi.spyOn(Logger, 'warn').mockImplementation(() => undefined);
             const service = createService(adapter);
 
             await expect(service.createIndicesIfNotExists()).resolves.toBeUndefined();
 
             expect(deleted).toEqual([created[0]]);
-            expect(warnSpy.mock.calls.some(([msg]) => msg.includes('Could not compare index'))).toBe(
-                true,
+            expect(warnSpy).toHaveBeenCalledWith(
+                expect.stringContaining('Could not compare index "test-variants"'),
+                loggerCtx,
+            );
+        });
+
+        it('reports a failed drift check as a warning, not an error', async () => {
+            const { adapter } = createMockAdapter({
+                onCreate: () => {
+                    throw new Error('Request timed out');
+                },
+            });
+            const service = createService(adapter);
+
+            await expect(service.createIndicesIfNotExists()).resolves.toBeUndefined();
+
+            // The drift check is diagnostic only. An ERROR line here would page whoever
+            // alerts on error logs for something that does not affect serving traffic.
+            expect(errorSpy).not.toHaveBeenCalled();
+            expect(warnSpy).toHaveBeenCalledWith(
+                expect.stringContaining('Could not compare index "test-variants"'),
+                loggerCtx,
             );
         });
 
@@ -156,14 +186,18 @@ describe('ElasticsearchService.createIndicesIfNotExists()', () => {
                     throw new Error('delete failed too');
                 },
             });
-            const warnSpy = vi.spyOn(Logger, 'warn').mockImplementation(() => undefined);
             const service = createService(adapter);
 
             await expect(service.createIndicesIfNotExists()).resolves.toBeUndefined();
 
-            const messages = warnSpy.mock.calls.map(([msg]) => msg);
-            expect(messages.some(msg => msg.includes('Could not compare index'))).toBe(true);
-            expect(messages.some(msg => msg.includes('Could not delete temporary index'))).toBe(true);
+            expect(warnSpy).toHaveBeenCalledWith(
+                expect.stringContaining('Could not compare index "test-variants"'),
+                loggerCtx,
+            );
+            expect(warnSpy).toHaveBeenCalledWith(
+                expect.stringContaining('Could not delete temporary index "temp-'),
+                loggerCtx,
+            );
         });
     });
 });

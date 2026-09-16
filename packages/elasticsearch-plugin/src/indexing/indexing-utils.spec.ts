@@ -1,6 +1,7 @@
 import { errors } from '@opensearch-project/opensearch';
 import { Logger } from '@vendure/core';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { MockInstance } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createIndices, describeSearchClientError } from './indexing-utils';
 
@@ -56,9 +57,15 @@ describe('describeSearchClientError()', () => {
 });
 
 describe('createIndices()', () => {
+    let errorSpy: MockInstance;
+
     beforeEach(() => {
-        vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
+        errorSpy = vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
         vi.spyOn(Logger, 'verbose').mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
     });
 
     it('creates the index and maps the alias', async () => {
@@ -87,16 +94,14 @@ describe('createIndices()', () => {
         await expect(createIndices(adapter, 'test-', {}, {})).rejects.toBe(error);
     });
 
-    it('logs the underlying error message when the create fails', async () => {
+    it('does not log the failure itself, leaving that to the caller', async () => {
         const error = new errors.TimeoutError('Request timed out', {} as any);
         const { adapter } = createMockAdapter(() => Promise.reject(error));
-        const logSpy = vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
 
         await expect(createIndices(adapter, 'test-', {}, {})).rejects.toBe(error);
 
-        expect(logSpy).toHaveBeenCalledTimes(1);
-        const message = logSpy.mock.calls[0][0];
-        expect(message).toContain('Request timed out');
-        expect(message).toContain('test-variants');
+        // Logging here as well as in the caller reported every failure twice, and turned
+        // the purely diagnostic drift check into an ERROR line.
+        expect(errorSpy).not.toHaveBeenCalled();
     });
 });

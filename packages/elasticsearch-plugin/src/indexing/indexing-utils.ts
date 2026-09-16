@@ -126,18 +126,12 @@ export async function createIndices(
     const indexName = prefix + VARIANT_INDEX_NAME + `${unixtimestampPostfix}`;
     const aliasName = prefix + VARIANT_INDEX_NAME + aliasPostfix;
 
-    try {
-        await createIndex(variantMappings, indexName, aliasName);
-    } catch (e: any) {
-        Logger.error(
-            `Could not create index "${mapAlias ? indexName : aliasName}": ${describeSearchClientError(e)}`,
-            loggerCtx,
-        );
-        // Rethrow: the index does not exist, so a caller that carries on as if it did
-        // will fail later with a much less obvious error (or silently index nothing).
-        // Callers that can tolerate the failure catch it themselves.
-        throw e;
-    }
+    // Not caught here: the index does not exist, so a caller that carries on as if it did
+    // will fail later with a much less obvious error (or silently index nothing). Every
+    // caller already knows the index it asked for and how severe the failure is for it, so
+    // each one logs at its own level. Logging here as well would report every failure
+    // twice, and would raise an ERROR for the purely diagnostic drift check.
+    await createIndex(variantMappings, indexName, aliasName);
 }
 
 export async function deleteIndices(adapter: SearchClientAdapter, prefix: string) {
