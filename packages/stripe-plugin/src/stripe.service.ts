@@ -60,6 +60,32 @@ export class StripeService {
             ...sanitizeMetadata(additionalParams?.metadata ?? {}),
         };
 
+        // The plugin's `captureMethod` option is authoritative: the payment handler and the
+        // webhook flow both branch on `isManualCapture()`, so the created intent must match the
+        // configured mode. A `capture_method` returned from `paymentIntentCreateParams` would
+        // otherwise override it here and desync the intent from that behaviour, so we enforce the
+        // configured value and warn if the callback tried to set a conflicting one.
+        const additional = { ...(additionalParams ?? {}) };
+        if (this.isManualCapture()) {
+            if (additional.capture_method && additional.capture_method !== 'manual') {
+                Logger.warn(
+                    `Ignoring capture_method '${additional.capture_method}' from paymentIntentCreateParams: ` +
+                        `the plugin is configured with captureMethod 'manual', which is authoritative.`,
+                    loggerCtx,
+                );
+            }
+            // Manual capture places a hold on the funds (status `requires_capture`) rather than
+            // charging immediately, so Vendure can secure stock before the money is captured.
+            additional.capture_method = 'manual';
+        } else if (additional.capture_method === 'manual') {
+            Logger.warn(
+                `Ignoring capture_method 'manual' from paymentIntentCreateParams: the plugin is ` +
+                    `configured with captureMethod 'automatic', which is authoritative.`,
+                loggerCtx,
+            );
+            delete additional.capture_method;
+        }
+
         const createParams: Stripe.PaymentIntentCreateParams = {
             amount: amountInMinorUnits,
             currency: order.currencyCode.toLowerCase(),
@@ -67,10 +93,7 @@ export class StripeService {
             automatic_payment_methods: {
                 enabled: true,
             },
-            // Manual capture places a hold on the funds (status `requires_capture`) rather than
-            // charging immediately, so Vendure can secure stock before the money is captured.
-            ...(this.isManualCapture() ? { capture_method: 'manual' as const } : {}),
-            ...(additionalParams ?? {}),
+            ...additional,
             metadata: allMetadata,
         };
         const idempotencyKey = `${order.code}_${amountInMinorUnits}`;

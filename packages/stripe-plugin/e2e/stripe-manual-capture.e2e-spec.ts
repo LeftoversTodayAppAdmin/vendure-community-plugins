@@ -83,7 +83,15 @@ function amountCapturableUpdatedEvent(order: FragmentOf<typeof testOrderFragment
 
 describe('Stripe manual capture', () => {
     const devConfig = mergeConfig(testConfig(), {
-        plugins: [StripePlugin.init({ captureMethod: 'manual' })],
+        plugins: [
+            StripePlugin.init({
+                captureMethod: 'manual',
+                // Return a conflicting capture_method from the create-params callback to prove the
+                // plugin's captureMethod option is authoritative: every intent in this suite must
+                // still be created with `capture_method: 'manual'` regardless of this value.
+                paymentIntentCreateParams: () => ({ capture_method: 'automatic' }),
+            }),
+        ],
     });
     const { shopClient, adminClient, server } = createTestEnvironment(devConfig);
     let serverPort: number;
@@ -147,7 +155,7 @@ describe('Stripe manual capture', () => {
             await setShipping(shopClient);
         });
 
-        it('creates the intent with capture_method manual', async () => {
+        it('creates the intent with capture_method manual (config overrides paymentIntentCreateParams)', async () => {
             let createBody: any;
             nock(STRIPE_BASE_URL)
                 .post('/v1/payment_intents', body => {

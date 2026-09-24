@@ -121,6 +121,10 @@ export const config: VendureConfig = {
   ],
 };
 ```
+
+Note: a `capture_method` returned here is ignored. The plugin's `captureMethod` option is
+authoritative, since the payment handler and webhook flow depend on it, so the intent is
+always created with the configured mode and a conflicting value is logged and dropped.
 ### requestOptions
 
 <MemberInfo kind="property" type={`(         injector: Injector,         ctx: RequestContext,         order: Order,     ) => AdditionalRequestOptions | Promise<AdditionalRequestOptions>`}  since="3.1.0"  />

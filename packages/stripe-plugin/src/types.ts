@@ -122,6 +122,10 @@ export interface StripePluginOptions {
      * };
      * ```
      *
+     * Note: a `capture_method` returned here is ignored. The plugin's `captureMethod` option is
+     * authoritative, since the payment handler and webhook flow depend on it, so the intent is
+     * always created with the configured mode and a conflicting value is logged and dropped.
+     *
      * @since 2.1.0
      *
      */
