@@ -7,6 +7,7 @@ import {
     Logger,
     Order,
     Payment,
+    PaymentMethod,
     PaymentMethodService,
     RequestContext,
     TransactionalConnection,
@@ -99,6 +100,15 @@ export class StripeService {
         return stripe.webhooks.constructEvent(payload, signature, stripe.webhookSecret);
     }
 
+    async constructEventForChannel(
+        ctx: RequestContext,
+        payload: Buffer,
+        signature: string,
+    ): Promise<Stripe.Event> {
+        const stripe = await this.getStripeClientForChannel(ctx);
+        return stripe.webhooks.constructEvent(payload, signature, stripe.webhookSecret);
+    }
+
     async createRefund(
         ctx: RequestContext,
         order: Order,
@@ -113,23 +123,28 @@ export class StripeService {
     }
 
     /**
+     * Get Stripe client for a channel, without requiring an order.
+     *
+     * Used to resolve the webhook secret before the payload is trusted:
+     * the credentials come from the channel's enabled Stripe payment
+     * method. Order eligibility is checked separately via
+     * {@link getStripeClient} once the event is verified.
+     */
+    async getStripeClientForChannel(ctx: RequestContext): Promise<VendureStripeClient> {
+        const stripePaymentMethod = await this.findEnabledStripePaymentMethod(ctx);
+        const apiKey = this.findOrThrowArgValue(stripePaymentMethod.handler.args, 'apiKey');
+        const webhookSecret = this.findOrThrowArgValue(stripePaymentMethod.handler.args, 'webhookSecret');
+        return new VendureStripeClient(apiKey, webhookSecret);
+    }
+
+    /**
      * Get Stripe client based on eligible payment methods for order
      */
     async getStripeClient(ctx: RequestContext, order: Order): Promise<VendureStripeClient> {
-        const [eligiblePaymentMethods, paymentMethods] = await Promise.all([
+        const [eligiblePaymentMethods, stripePaymentMethod] = await Promise.all([
             this.paymentMethodService.getEligiblePaymentMethods(ctx, order),
-            this.paymentMethodService.findAll(ctx, {
-                filter: {
-                    enabled: { eq: true },
-                },
-            }),
+            this.findEnabledStripePaymentMethod(ctx),
         ]);
-        const stripePaymentMethod = paymentMethods.items.find(
-            pm => pm.handler.code === stripePaymentMethodHandler.code,
-        );
-        if (!stripePaymentMethod) {
-            throw new UserInputError('No enabled Stripe payment method found');
-        }
         const isEligible = eligiblePaymentMethods.some(pm => pm.code === stripePaymentMethod.code);
         if (!isEligible) {
             throw new UserInputError(`Stripe payment method is not eligible for order ${order.code}`);
@@ -137,6 +152,21 @@ export class StripeService {
         const apiKey = this.findOrThrowArgValue(stripePaymentMethod.handler.args, 'apiKey');
         const webhookSecret = this.findOrThrowArgValue(stripePaymentMethod.handler.args, 'webhookSecret');
         return new VendureStripeClient(apiKey, webhookSecret);
+    }
+
+    private async findEnabledStripePaymentMethod(ctx: RequestContext): Promise<PaymentMethod> {
+        const paymentMethods = await this.paymentMethodService.findAll(ctx, {
+            filter: {
+                enabled: { eq: true },
+            },
+        });
+        const stripePaymentMethod = paymentMethods.items.find(
+            pm => pm.handler.code === stripePaymentMethodHandler.code,
+        );
+        if (!stripePaymentMethod) {
+            throw new UserInputError('No enabled Stripe payment method found');
+        }
+        return stripePaymentMethod;
     }
 
     private findOrThrowArgValue(args: ConfigArg[], name: string): string {

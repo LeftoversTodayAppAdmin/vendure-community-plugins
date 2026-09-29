@@ -50,30 +50,56 @@ export class StripeController {
             return;
         }
 
-        const event = JSON.parse(request.body.toString()) as Stripe.Event;
-        const paymentIntent = event.data.object as Stripe.PaymentIntent;
+        // Everything parsed here is untrusted until the signature is verified
+        // below. Only the event shape is inspected pre-verification, so that
+        // foreign payment intents can still be skipped with a 200.
+        const unverifiedEvent = JSON.parse(request.body.toString()) as Stripe.Event;
+        const unverifiedPaymentIntent = unverifiedEvent.data.object as Stripe.PaymentIntent;
 
-        if (!paymentIntent) {
+        if (!unverifiedPaymentIntent) {
             Logger.error(noPaymentIntentErrorMessage, loggerCtx);
             response.status(HttpStatus.BAD_REQUEST).send(noPaymentIntentErrorMessage);
             return;
         }
 
-        const { metadata } = paymentIntent;
+        const { metadata: unverifiedMetadata } = unverifiedPaymentIntent;
 
-        if (!isExpectedVendureStripeEventMetadata(metadata)) {
+        if (!isExpectedVendureStripeEventMetadata(unverifiedMetadata)) {
             if (this.options.skipPaymentIntentsWithoutExpectedMetadata) {
                 response.status(HttpStatus.OK).send(ignorePaymentIntentEvent);
                 return;
             }
             throw new Error(
-                `Missing expected payment intent metadata, unable to settle payment ${paymentIntent.id}!`,
+                `Missing expected payment intent metadata, unable to settle payment ${unverifiedPaymentIntent.id}!`,
             );
         }
 
-        const { channelToken, orderCode, orderId, languageCode } = metadata;
+        const { channelToken, languageCode } = unverifiedMetadata;
 
         const outerCtx = await this.createContext(channelToken, languageCode, request);
+
+        // Verify the signature before looking up the order: the secret is
+        // resolved from the channel, so no order is needed yet. From here on,
+        // `event` is the trusted payload returned by Stripe's SDK.
+        let event: Stripe.Event;
+        try {
+            // Throws an error if the signature is invalid
+            event = await this.stripeService.constructEventForChannel(
+                outerCtx,
+                request.rawBody,
+                signature,
+            );
+        } catch (e: any) {
+            Logger.error(`${signatureErrorMessage} ${signature}: ${(e as Error)?.message}`, loggerCtx);
+            response.status(HttpStatus.BAD_REQUEST).send(signatureErrorMessage);
+            return;
+        }
+
+        const paymentIntent = event.data.object as Stripe.PaymentIntent;
+        const { orderCode, orderId } = paymentIntent.metadata as {
+            orderCode: string;
+            orderId: string;
+        };
 
         await this.connection.withTransaction(outerCtx, async (ctx: RequestContext) => {
             const order = await this.orderService.findOneByCode(ctx, orderCode);
@@ -84,14 +110,9 @@ export class StripeController {
                 );
             }
 
-            try {
-                // Throws an error if the signature is invalid
-                await this.stripeService.constructEventFromPayload(ctx, order, request.rawBody, signature);
-            } catch (e: any) {
-                Logger.error(`${signatureErrorMessage} ${signature}: ${(e as Error)?.message}`, loggerCtx);
-                response.status(HttpStatus.BAD_REQUEST).send(signatureErrorMessage);
-                return;
-            }
+            // The secret was resolved without the order; run the unchanged
+            // eligibility gate now that the order is known.
+            await this.stripeService.getStripeClient(ctx, order);
 
             if (event.type === 'payment_intent.payment_failed') {
                 const message = paymentIntent.last_payment_error?.message ?? 'unknown error';
