@@ -46,7 +46,7 @@ import {
     VariantIndexItem,
 } from '../types';
 
-import { createIndices, getIndexNameByAlias } from './indexing-utils';
+import { createIndices, describeSearchClientError, getIndexNameByAlias } from './indexing-utils';
 
 export const defaultProductRelations: Array<EntityRelationPaths<Product>> = [
     'featuredAsset',
@@ -253,8 +253,8 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
                         `-reindex-${reindexTempName}`,
                     );
                 } catch (e: any) {
-                    Logger.error('Could not recreate indices.', loggerCtx);
-                    Logger.error(JSON.stringify(e), loggerCtx);
+                    Logger.error(`Could not recreate indices for "${reindexVariantAliasName}".`, loggerCtx);
+                    Logger.error(describeSearchClientError(e), loggerCtx);
                     throw e;
                 }
 
