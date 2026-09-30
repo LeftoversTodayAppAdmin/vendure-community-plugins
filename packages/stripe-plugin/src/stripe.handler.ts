@@ -11,7 +11,7 @@ import {
 } from '@vendure/core';
 import Stripe from 'stripe';
 
-import { getAmountFromStripeMinorUnits } from './stripe-utils';
+import { getAmountFromStripeMinorUnits, isRetryableStripeError } from './stripe-utils';
 import { StripeService } from './stripe.service';
 
 const { StripeError } = Stripe.errors;
@@ -89,6 +89,13 @@ export const stripePaymentMethodHandler = new PaymentMethodHandler({
                 errorMessage: `Could not capture PaymentIntent ${payment.transactionId}, status is '${captured.status}'`,
             };
         } catch (e: any) {
+            // A temporary error must not be recorded as a failed settlement: Vendure would move the
+            // payment to `Error`, which can't be settled again, and the authorization would be stuck.
+            // Throwing rolls back the caller's transaction instead, so the payment stays `Authorized`
+            // and the capture can be retried (the webhook returns 5xx and Stripe redelivers it).
+            if (isRetryableStripeError(e)) {
+                throw e;
+            }
             if (e instanceof StripeError) {
                 return { success: false, errorMessage: e.message };
             }
@@ -104,9 +111,19 @@ export const stripePaymentMethodHandler = new PaymentMethodHandler({
         }
         // Manual capture: void the authorization so the held funds are released without a charge.
         try {
-            await stripeService.cancelPaymentIntent(ctx, order, payment.transactionId);
-            return { success: true };
+            const cancelled = await stripeService.cancelPaymentIntent(ctx, order, payment.transactionId);
+            if (cancelled.status === 'canceled') {
+                return { success: true };
+            }
+            return {
+                success: false,
+                errorMessage: `Could not cancel PaymentIntent ${payment.transactionId}, status is '${cancelled.status}'`,
+            };
         } catch (e: any) {
+            // As in `settlePayment`, a temporary error leaves the payment as it is so it can be retried.
+            if (isRetryableStripeError(e)) {
+                throw e;
+            }
             if (e instanceof StripeError) {
                 return { success: false, errorMessage: e.message };
             }

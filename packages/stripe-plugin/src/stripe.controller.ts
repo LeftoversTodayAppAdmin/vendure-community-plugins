@@ -2,7 +2,9 @@ import { Controller, Headers, HttpStatus, Inject, Post, Req, Res } from '@nestjs
 import type { PaymentMethod, RequestContext } from '@vendure/core';
 import {
     ChannelService,
+    ID,
     InternalServerError,
+    isGraphQlErrorResult,
     LanguageCode,
     Logger,
     Order,
@@ -117,6 +119,13 @@ export class StripeController {
 
         try {
             await this.connection.withTransaction(outerCtx, async (ctx: RequestContext) => {
+                // Serialize webhook processing per order: a concurrent delivery of the same event
+                // waits here until this one commits, then finds the recorded payment below and does
+                // nothing. This must be the first read in the transaction: under REPEATABLE READ (the
+                // MySQL/MariaDB default) later plain reads see a snapshot taken at the first read, so
+                // locking first is what lets them see a payment the other delivery just committed.
+                await this.lockOrderForUpdate(ctx, orderId);
+
                 const order = await this.orderService.findOneByCode(ctx, orderCode);
 
                 if (!order) {
@@ -166,6 +175,25 @@ export class StripeController {
                         loggerCtx,
                     );
                     return;
+                }
+
+                if (isManualCapture) {
+                    // The event payload is a snapshot taken when the event was created. A redelivered
+                    // authorization event can describe an intent that has since been voided (for
+                    // example the void went through but its response was lost), so act on the
+                    // intent's live state rather than arranging the order for a hold that is gone.
+                    const liveIntent = await this.stripeService.retrievePaymentIntent(
+                        ctx,
+                        order,
+                        paymentIntent.id,
+                    );
+                    if (liveIntent.status !== 'requires_capture' && liveIntent.status !== 'succeeded') {
+                        Logger.info(
+                            `PaymentIntent ${paymentIntent.id} for order ${orderCode} is '${liveIntent.status}', nothing to authorize`,
+                            loggerCtx,
+                        );
+                        return;
+                    }
                 }
 
                 if (order.state !== 'ArrangingPayment' && order.state !== 'ArrangingAdditionalPayment') {
@@ -263,13 +291,17 @@ export class StripeController {
                     });
                     if (authorizedPayment) {
                         const settleResult = await this.orderService.settlePayment(ctx, authorizedPayment.id);
-                        if (!(settleResult instanceof Order)) {
+                        // `settlePayment` returns the settled Payment on success and an error result
+                        // otherwise, never an Order.
+                        if (isGraphQlErrorResult(settleResult)) {
                             // Capture failed after a successful authorization. The order stays in
                             // PaymentAuthorized with the funds still held, so it can be captured or
                             // cancelled from the Admin UI. Do not void here.
                             Logger.error(
                                 `Authorized order ${orderCode} but could not capture payment ${paymentIntent.id}: ${
-                                    'message' in settleResult ? settleResult.message : 'unknown error'
+                                    'paymentErrorMessage' in settleResult && settleResult.paymentErrorMessage
+                                        ? settleResult.paymentErrorMessage
+                                        : settleResult.message
                                 }`,
                                 loggerCtx,
                             );
@@ -295,18 +327,37 @@ export class StripeController {
 
         if (shouldVoidAuthorization && orderForVoid) {
             try {
-                await this.stripeService.cancelPaymentIntent(outerCtx, orderForVoid, paymentIntent.id);
-                Logger.warn(
-                    `Voided Stripe authorization ${paymentIntent.id} for order ${orderCode}: order could not be arranged`,
-                    loggerCtx,
+                const voided = await this.stripeService.cancelPaymentIntent(
+                    outerCtx,
+                    orderForVoid,
+                    paymentIntent.id,
                 );
+                if (voided.status === 'canceled') {
+                    Logger.warn(
+                        `Voided Stripe authorization ${paymentIntent.id} for order ${orderCode}: order could not be arranged`,
+                        loggerCtx,
+                    );
+                } else {
+                    // The intent can no longer be voided (for example it was captured in the
+                    // meantime). Redelivering the event would not change that, so acknowledge it.
+                    Logger.error(
+                        `Could not void Stripe authorization ${paymentIntent.id} for order ${orderCode}: status is '${voided.status}'`,
+                        loggerCtx,
+                    );
+                }
             } catch (e: any) {
+                // The hold may still be in place. Respond with a 5xx so Stripe redelivers the event and
+                // the void is retried. On redelivery, an intent that was in fact voided is recognised
+                // from its live state and acknowledged.
                 Logger.error(
                     `Failed to void Stripe authorization ${paymentIntent.id} for order ${orderCode}: ${
                         (e as Error)?.message
                     }`,
                     loggerCtx,
                 );
+                if (!response.headersSent) {
+                    response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('Error voiding authorization');
+                }
             }
         }
 
@@ -314,6 +365,21 @@ export class StripeController {
         if (!response.headersSent) {
             response.status(HttpStatus.OK).send('Ok');
         }
+    }
+
+    /**
+     * Takes a row lock on the order for the rest of the current transaction. Skipped on SQLite
+     * drivers, which don't support row locks and only allow one writer at a time anyway.
+     */
+    private async lockOrderForUpdate(ctx: RequestContext, orderId: ID): Promise<void> {
+        const driver = this.connection.rawConnection.options.type;
+        if (driver === 'sqlite' || driver === 'sqljs' || driver === 'better-sqlite3') {
+            return;
+        }
+        await this.connection.getRepository(ctx, Order).findOne({
+            where: { id: orderId },
+            lock: { mode: 'pessimistic_write' },
+        });
     }
 
     private async createContext(

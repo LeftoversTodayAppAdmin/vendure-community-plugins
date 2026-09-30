@@ -3,6 +3,7 @@ import { ModuleRef } from '@nestjs/core';
 import { ConfigArg } from '@vendure/common/lib/generated-types';
 import {
     Customer,
+    IllegalOperationError,
     Injector,
     Logger,
     Order,
@@ -18,9 +19,15 @@ import Stripe from 'stripe';
 import { loggerCtx, STRIPE_PLUGIN_OPTIONS } from './constants';
 import { sanitizeMetadata } from './metadata-sanitize';
 import { VendureStripeClient } from './stripe-client';
-import { getAmountInStripeMinorUnits } from './stripe-utils';
+import { getAmountInStripeMinorUnits, isUnexpectedIntentStateError } from './stripe-utils';
 import { stripePaymentMethodHandler } from './stripe.handler';
 import { StripePluginOptions } from './types';
+
+/**
+ * How many PaymentIntents a single order and amount may go through in manual-capture mode (the
+ * first one plus replacements for cancelled ones) before intent creation is refused.
+ */
+const MAX_PAYMENT_INTENT_ATTEMPTS = 10;
 
 @Injectable()
 export class StripeService {
@@ -107,10 +114,16 @@ export class StripeService {
         // In manual-capture mode an intent can be cancelled server-side (for example when a stock
         // check fails after authorization). Because the idempotency key above replays the original
         // response, a same-amount retry would hand back the cancelled intent's client secret, which
-        // can no longer be confirmed. Retrieve the live intent and, if it is no longer confirmable,
-        // mint a fresh one so a retry always gets a usable intent.
+        // can no longer be confirmed. Follow the chain of replacements to the current intent.
         const usableIntent = this.isManualCapture()
-            ? await this.ensureConfirmableIntent(stripe, paymentIntent, createParams, idempotencyKey, requestOptions)
+            ? await this.resolveConfirmableIntent(
+                  stripe,
+                  paymentIntent,
+                  createParams,
+                  idempotencyKey,
+                  requestOptions,
+                  order.code,
+              )
             : paymentIntent;
 
         if (!usableIntent.client_secret) {
@@ -134,8 +147,27 @@ export class StripeService {
     }
 
     /**
+     * Retrieves the live state of a PaymentIntent. Webhook payloads are a snapshot taken when the
+     * event was created, so a redelivered event can describe an intent that has since been captured
+     * or cancelled.
+     */
+    async retrievePaymentIntent(
+        ctx: RequestContext,
+        order: Order,
+        paymentIntentId: string,
+    ): Promise<Stripe.PaymentIntent> {
+        const stripe = await this.getStripeClient(ctx, order);
+        const requestOptions = await this.resolveRequestOptions(ctx, order);
+        return stripe.paymentIntents.retrieve(paymentIntentId, undefined, requestOptions);
+    }
+
+    /**
      * Captures a previously authorized PaymentIntent, charging the held funds. Used by the payment
      * handler's `settlePayment` in manual-capture mode.
+     *
+     * Safe to call again: if the intent can no longer be captured (typically because an earlier
+     * attempt already captured it and only the response was lost), its live state is returned so the
+     * caller can decide from the status.
      */
     async capturePaymentIntent(
         ctx: RequestContext,
@@ -144,13 +176,24 @@ export class StripeService {
     ): Promise<Stripe.PaymentIntent> {
         const stripe = await this.getStripeClient(ctx, order);
         const requestOptions = await this.resolveRequestOptions(ctx, order);
-        return stripe.paymentIntents.capture(paymentIntentId, undefined, requestOptions);
+        try {
+            return await stripe.paymentIntents.capture(paymentIntentId, undefined, requestOptions);
+        } catch (e) {
+            if (isUnexpectedIntentStateError(e)) {
+                return stripe.paymentIntents.retrieve(paymentIntentId, undefined, requestOptions);
+            }
+            throw e;
+        }
     }
 
     /**
      * Voids (cancels) a PaymentIntent, releasing any authorized hold without charging the customer.
      * Used to release the hold when an order cannot be arranged after authorization, and by the
      * handler's `cancelPayment`.
+     *
+     * Safe to call again: if the intent can no longer be cancelled (typically because an earlier
+     * attempt already cancelled it), its live state is returned so the caller can decide from the
+     * status.
      */
     async cancelPaymentIntent(
         ctx: RequestContext,
@@ -159,37 +202,56 @@ export class StripeService {
     ): Promise<Stripe.PaymentIntent> {
         const stripe = await this.getStripeClient(ctx, order);
         const requestOptions = await this.resolveRequestOptions(ctx, order);
-        return stripe.paymentIntents.cancel(paymentIntentId, undefined, requestOptions);
+        try {
+            return await stripe.paymentIntents.cancel(paymentIntentId, undefined, requestOptions);
+        } catch (e) {
+            if (isUnexpectedIntentStateError(e)) {
+                return stripe.paymentIntents.retrieve(paymentIntentId, undefined, requestOptions);
+            }
+            throw e;
+        }
     }
 
     /**
-     * Returns the created intent if it can still be confirmed; otherwise creates and returns a fresh
-     * one. Used only in manual-capture mode, where the idempotency key can replay a cancelled intent
-     * whose client secret is no longer usable.
+     * Returns the order's current PaymentIntent if it can still be confirmed. Used only in
+     * manual-capture mode, where an intent can be cancelled server-side after authorization.
+     *
+     * The first intent for an order and amount is created under `${order.code}_${amount}`. When that
+     * intent is cancelled, its replacement is created under a key derived from the cancelled intent's
+     * ID, so every retry, sequential or concurrent, is handed the same replacement by Stripe instead
+     * of creating another one. Stripe's idempotency store is the record of these attempts, so nothing
+     * has to be stored on the order.
+     *
+     * An intent that is already authorized, processing or captured is never replaced, since that
+     * would let the customer place a second hold for the same order.
      */
-    private async ensureConfirmableIntent(
+    private async resolveConfirmableIntent(
         stripe: VendureStripeClient,
         createdIntent: Stripe.PaymentIntent,
         createParams: Stripe.PaymentIntentCreateParams,
         idempotencyKey: string,
         requestOptions: Stripe.RequestOptions | undefined,
+        orderCode: string,
     ): Promise<Stripe.PaymentIntent> {
-        let live: Stripe.PaymentIntent;
-        try {
-            live = await stripe.paymentIntents.retrieve(createdIntent.id, undefined, requestOptions);
-        } catch {
-            // If the live status cannot be read, fall back to the created intent.
-            return createdIntent;
+        let intent = createdIntent;
+        for (let attempt = 0; attempt < MAX_PAYMENT_INTENT_ATTEMPTS; attempt++) {
+            const live = await stripe.paymentIntents.retrieve(intent.id, undefined, requestOptions);
+            if (this.isConfirmableStatus(live.status)) {
+                return live;
+            }
+            if (live.status !== 'canceled') {
+                throw new IllegalOperationError(
+                    `A payment for order ${orderCode} is already authorized or completed (${live.status})`,
+                );
+            }
+            intent = await stripe.paymentIntents.create(createParams, {
+                ...(requestOptions ?? {}),
+                idempotencyKey: `${idempotencyKey}_after_${live.id}`,
+            });
         }
-        if (live.client_secret && this.isConfirmableStatus(live.status)) {
-            return live;
-        }
-        // The replayed intent is no longer confirmable (e.g. cancelled). Mint a fresh one with a
-        // unique idempotency key so it is not itself a replay of the dead intent.
-        return stripe.paymentIntents.create(createParams, {
-            ...(requestOptions ?? {}),
-            idempotencyKey: `${idempotencyKey}_${Date.now()}`,
-        });
+        throw new IllegalOperationError(
+            `Too many cancelled payment attempts for order ${orderCode}, please contact support`,
+        );
     }
 
     private isConfirmableStatus(status: Stripe.PaymentIntent.Status): boolean {
