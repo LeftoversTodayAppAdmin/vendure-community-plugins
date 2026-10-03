@@ -54,15 +54,17 @@ export function isExpectedVendureStripeEventMetadata(metadata: Stripe.Metadata):
 /**
  * @description
  * Whether a Stripe error is temporary, so the same request can succeed later: a network failure,
- * a Stripe-side error (5xx) or rate limiting. The SDK has already retried these by the time they
- * surface here, so the caller should let the operation fail in a way that can be retried later
- * rather than record a permanent failure.
+ * a Stripe-side error (5xx), rate limiting or an idempotency conflict (the same request is still
+ * being processed). The SDK has already retried these by the time they surface here, so the caller
+ * should let the operation fail in a way that can be retried later rather than record a permanent
+ * failure.
  */
 export function isRetryableStripeError(e: unknown): boolean {
     return (
         e instanceof Stripe.errors.StripeConnectionError ||
         e instanceof Stripe.errors.StripeAPIError ||
-        e instanceof Stripe.errors.StripeRateLimitError
+        e instanceof Stripe.errors.StripeRateLimitError ||
+        e instanceof Stripe.errors.StripeIdempotencyError
     );
 }
 

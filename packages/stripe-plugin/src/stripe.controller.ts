@@ -16,10 +16,10 @@ import {
 } from '@vendure/core';
 import { OrderStateTransitionError } from '@vendure/core/dist/common/error/generated-graphql-shop-errors';
 import type { Response } from 'express';
-import type Stripe from 'stripe';
+import Stripe from 'stripe';
 
 import { loggerCtx, STRIPE_PLUGIN_OPTIONS } from './constants';
-import { isExpectedVendureStripeEventMetadata } from './stripe-utils';
+import { isExpectedVendureStripeEventMetadata, isRetryableStripeError } from './stripe-utils';
 import { stripePaymentMethodHandler } from './stripe.handler';
 import { StripeService } from './stripe.service';
 import { RequestWithRawBody, StripePluginOptions } from './types';
@@ -116,6 +116,10 @@ export class StripeController {
         // item sold out). The hold is released after the transaction settles/rolls back.
         let orderForVoid: Order | undefined;
         let shouldVoidAuthorization = false;
+        // Set when the payment is recorded as `Authorized` and the funds still have to be captured.
+        // Stripe is only called once the transaction that recorded the payment has committed, so a
+        // capture can never succeed while Vendure rolls back the payment.
+        let orderToCapture: Order | undefined;
 
         try {
             await this.connection.withTransaction(outerCtx, async (ctx: RequestContext) => {
@@ -146,12 +150,23 @@ export class StripeController {
                     return;
                 }
 
-                // In manual-capture mode `succeeded` fires after the plugin captures and `canceled`
-                // after it voids, so both merely confirm an action already taken here.
+                // In manual-capture mode `succeeded` fires after the funds were captured. Normally the
+                // capture step below has settled the payment already, but if the process stopped
+                // between the capture and the settlement the payment is still `Authorized`, so settle
+                // it here. Nothing is done for a payment that is already settled, which makes
+                // redeliveries and the race with the capture step harmless.
                 if (isManualCapture && event.type === 'payment_intent.succeeded') {
-                    Logger.info(`Capture confirmed for order ${orderCode} (${paymentIntent.id})`, loggerCtx);
+                    const settled = await this.settleCapturedPayment(ctx, orderCode, paymentIntent.id);
+                    if (!settled) {
+                        Logger.info(
+                            `Capture confirmed for order ${orderCode} (${paymentIntent.id}), no payment to settle`,
+                            loggerCtx,
+                        );
+                    }
                     return;
                 }
+                // In manual-capture mode `canceled` fires after the plugin voids the authorization, so
+                // it merely confirms an action already taken here.
                 if (isManualCapture && event.type === 'payment_intent.canceled') {
                     Logger.info(`Authorization voided for order ${orderCode} (${paymentIntent.id})`, loggerCtx);
                     return;
@@ -170,6 +185,16 @@ export class StripeController {
                     where: { transactionId: paymentIntent.id },
                 });
                 if (existingPayment) {
+                    if (isManualCapture && existingPayment.state === 'Authorized') {
+                        // An earlier delivery recorded the authorization but did not get to capture
+                        // it (a temporary Stripe error, or the process stopped), so pick up from there.
+                        Logger.info(
+                            `Payment for intent ${paymentIntent.id} is still authorized, resuming capture for order ${orderCode}`,
+                            loggerCtx,
+                        );
+                        orderToCapture = order;
+                        return;
+                    }
                     Logger.info(
                         `Payment for intent ${paymentIntent.id} already recorded, skipping order ${orderCode}`,
                         loggerCtx,
@@ -284,29 +309,9 @@ export class StripeController {
                 );
 
                 if (isManualCapture) {
-                    // The order is now in PaymentAuthorized and stock has been allocated, so it is safe
-                    // to capture the held funds by settling the payment (moving it to PaymentSettled).
-                    const authorizedPayment = await this.connection.getRepository(ctx, Payment).findOne({
-                        where: { transactionId: paymentIntent.id },
-                    });
-                    if (authorizedPayment) {
-                        const settleResult = await this.orderService.settlePayment(ctx, authorizedPayment.id);
-                        // `settlePayment` returns the settled Payment on success and an error result
-                        // otherwise, never an Order.
-                        if (isGraphQlErrorResult(settleResult)) {
-                            // Capture failed after a successful authorization. The order stays in
-                            // PaymentAuthorized with the funds still held, so it can be captured or
-                            // cancelled from the Admin UI. Do not void here.
-                            Logger.error(
-                                `Authorized order ${orderCode} but could not capture payment ${paymentIntent.id}: ${
-                                    'paymentErrorMessage' in settleResult && settleResult.paymentErrorMessage
-                                        ? settleResult.paymentErrorMessage
-                                        : settleResult.message
-                                }`,
-                                loggerCtx,
-                            );
-                        }
-                    }
+                    // The order is now in PaymentAuthorized and stock has been allocated. The funds are
+                    // captured after this transaction commits, see below.
+                    orderToCapture = order;
                 }
             });
         } catch (e: any) {
@@ -322,6 +327,25 @@ export class StripeController {
             );
             if (!response.headersSent) {
                 response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('Error processing webhook');
+            }
+        }
+
+        if (orderToCapture && !response.headersSent) {
+            try {
+                await this.captureAndSettle(outerCtx, orderToCapture, paymentIntent.id);
+            } catch (e: any) {
+                // The authorized payment is committed, so nothing is lost: respond with a 5xx so Stripe
+                // redelivers the event, which resumes from the `Authorized` payment (and the
+                // `payment_intent.succeeded` event settles it if the funds were captured already).
+                Logger.error(
+                    `Error capturing Stripe payment ${paymentIntent.id} for order ${orderCode}: ${
+                        (e as Error)?.message
+                    }`,
+                    loggerCtx,
+                );
+                if (!response.headersSent) {
+                    response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('Error capturing payment');
+                }
             }
         }
 
@@ -365,6 +389,84 @@ export class StripeController {
         if (!response.headersSent) {
             response.status(HttpStatus.OK).send('Ok');
         }
+    }
+
+    /**
+     * Captures the funds held for an `Authorized` payment and then settles the payment. Must be
+     * called outside of any database transaction: Stripe is called first, so that a capture can
+     * only be followed by a short, database-only transaction that records it.
+     *
+     * If the process stops after the capture, or the settlement fails, the payment stays
+     * `Authorized` and is settled by the `payment_intent.succeeded` webhook or by a redelivery of
+     * the authorization event. A temporary Stripe error is thrown so the webhook responds with a 5xx.
+     */
+    private async captureAndSettle(outerCtx: RequestContext, order: Order, paymentIntentId: string) {
+        let captured: Stripe.PaymentIntent;
+        try {
+            captured = await this.stripeService.capturePaymentIntent(outerCtx, order, paymentIntentId);
+        } catch (e: any) {
+            if (e instanceof Stripe.errors.StripeError && !isRetryableStripeError(e)) {
+                // Stripe refused the capture and repeating it would not change that. The payment stays
+                // `Authorized` with the funds still held, so it can be captured or cancelled from the
+                // Admin UI.
+                Logger.error(
+                    `Authorized order ${order.code} but could not capture payment ${paymentIntentId}: ${e.message}`,
+                    loggerCtx,
+                );
+                return;
+            }
+            throw e;
+        }
+        if (captured.status !== 'succeeded' && captured.status !== 'processing') {
+            Logger.error(
+                `Authorized order ${order.code} but could not capture payment ${paymentIntentId}: status is '${captured.status}'`,
+                loggerCtx,
+            );
+            return;
+        }
+        await this.connection.withTransaction(outerCtx, async ctx => {
+            // Same lock as the webhook's first transaction: if the `succeeded` event got here first it
+            // has already settled the payment, which `settleCapturedPayment` then leaves alone.
+            await this.lockOrderForUpdate(ctx, order.id);
+            await this.settleCapturedPayment(ctx, order.code, paymentIntentId);
+        });
+    }
+
+    /**
+     * Settles the payment for a PaymentIntent that Stripe has captured, but only if it is still
+     * `Authorized`. Returns whether a payment was settled. Must run in a transaction that already
+     * holds the order lock; it makes no Stripe calls.
+     */
+    private async settleCapturedPayment(
+        ctx: RequestContext,
+        orderCode: string,
+        paymentIntentId: string,
+    ): Promise<boolean> {
+        const paymentRepository = this.connection.getRepository(ctx, Payment);
+        const payment = await paymentRepository.findOne({ where: { transactionId: paymentIntentId } });
+        if (!payment || payment.state !== 'Authorized') {
+            return false;
+        }
+        // Tells the payment handler that the funds are captured, so settling doesn't call Stripe
+        // again from inside this transaction.
+        payment.metadata = { ...payment.metadata, paymentIntentCaptured: true };
+        await paymentRepository.save(payment, { reload: false });
+        const settleResult = await this.orderService.settlePayment(ctx, payment.id);
+        // `settlePayment` returns the settled Payment on success and an error result otherwise,
+        // never an Order.
+        if (isGraphQlErrorResult(settleResult)) {
+            Logger.error(
+                `Captured payment ${paymentIntentId} for order ${orderCode} but could not settle it: ${
+                    'paymentErrorMessage' in settleResult && settleResult.paymentErrorMessage
+                        ? settleResult.paymentErrorMessage
+                        : settleResult.message
+                }`,
+                loggerCtx,
+            );
+            return false;
+        }
+        Logger.info(`Settled payment ${paymentIntentId} for order ${orderCode}`, loggerCtx);
+        return true;
     }
 
     /**

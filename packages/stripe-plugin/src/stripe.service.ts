@@ -162,8 +162,13 @@ export class StripeService {
     }
 
     /**
-     * Captures a previously authorized PaymentIntent, charging the held funds. Used by the payment
-     * handler's `settlePayment` in manual-capture mode.
+     * Captures a previously authorized PaymentIntent, charging the held funds. Called by the
+     * webhook controller once the authorized payment has been committed, and by the payment
+     * handler's `settlePayment` for captures started from the Admin UI.
+     *
+     * The request carries a key derived from the PaymentIntent, so a repeated capture of the same
+     * intent (a redelivered webhook, or a retry after a lost response) is answered with the first
+     * result instead of acting twice.
      *
      * Safe to call again: if the intent can no longer be captured (typically because an earlier
      * attempt already captured it and only the response was lost), its live state is returned so the
@@ -177,7 +182,10 @@ export class StripeService {
         const stripe = await this.getStripeClient(ctx, order);
         const requestOptions = await this.resolveRequestOptions(ctx, order);
         try {
-            return await stripe.paymentIntents.capture(paymentIntentId, undefined, requestOptions);
+            return await stripe.paymentIntents.capture(paymentIntentId, undefined, {
+                ...(requestOptions ?? {}),
+                idempotencyKey: `${paymentIntentId}_capture`,
+            });
         } catch (e) {
             if (isUnexpectedIntentStateError(e)) {
                 return stripe.paymentIntents.retrieve(paymentIntentId, undefined, requestOptions);

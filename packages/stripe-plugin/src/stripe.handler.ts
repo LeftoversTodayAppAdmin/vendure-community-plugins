@@ -78,7 +78,14 @@ export const stripePaymentMethodHandler = new PaymentMethodHandler({
             // settling on the Vendure side is a no-op.
             return { success: true };
         }
-        // Manual capture: charge the funds that were authorized at `createPayment` time.
+        // The webhook controller captures the funds outside its database transaction and only then
+        // settles the payment, flagging it so that no Stripe call is made while that transaction is
+        // open.
+        if (payment.metadata?.paymentIntentCaptured === true) {
+            return { success: true };
+        }
+        // Manual capture started elsewhere (for example from the Admin UI): charge the funds that
+        // were authorized at `createPayment` time.
         try {
             const captured = await stripeService.capturePaymentIntent(ctx, order, payment.transactionId);
             if (captured.status === 'succeeded' || captured.status === 'processing') {
