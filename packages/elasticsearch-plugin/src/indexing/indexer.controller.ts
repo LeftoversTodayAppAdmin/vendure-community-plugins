@@ -203,9 +203,20 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
 
     /**
      * Pre-enqueue guard for stock movements: returns `true` if the movement would change a
-     * product's indexed `inStock`/`productInStock` (so the caller should enqueue an update),
-     * `false` if it provably would not. Only active for `reindexOnStockMovement:
+     * variant's indexed `inStock` or its product's `productInStock` (so the caller should enqueue an
+     * update), `false` if it provably would not. Only active for `reindexOnStockMovement:
      * 'onStockStatusChange'`; otherwise always `true`.
+     *
+     * The check is scoped to the moved variants (see vendurehq/community-plugins#51). A variant's
+     * `inStock` can only flip if its own stock moved, and `productInStock` can only flip if some
+     * variant's `inStock` flipped, so if none of the moved variants flipped in any channel, nothing
+     * this guard cares about changed. That costs one variant load, one index search and one saleable
+     * stock lookup per moved variant per channel, regardless of how many variants the product has.
+     *
+     * Trade-off: because sibling variants are not recomputed, the guard no longer notices a
+     * `productInStock` that is already stale in the index for an unrelated reason (for example a
+     * write that failed earlier). Repairing a stale index is not this guard's job; a reindex or the
+     * next non-stock update of the product does that.
      *
      * The check inspects only the built-in stock booleans, so it is applied only when no custom
      * product or variant mapping is configured. When one is, a custom field could derive from stock
@@ -221,13 +232,10 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
         }
         try {
             const mutableCtx = MutableRequestContext.deserialize(ctx.serialize());
-            const productIds = await this.getProductIdsByVariantIds(variants.map(v => v.id));
-            for (const productId of productIds) {
-                if (await this.productStockStatusDiffersFromIndex(mutableCtx, productId)) {
-                    return true;
-                }
-            }
-            return false;
+            return await this.movedVariantsStockStatusDiffersFromIndex(
+                mutableCtx,
+                unique(variants.map(v => v.id)),
+            );
         } catch (e: any) {
             Logger.warn(
                 `Stock-movement guard could not evaluate, will enqueue an update: ${e.message}`,
@@ -250,84 +258,83 @@ export class ElasticsearchIndexerController implements OnModuleInit, OnModuleDes
     }
 
     /**
-     * Recomputes a product's per-channel stock booleans and compares them to what is currently
-     * indexed. Returns `true` if any variant `inStock` or the product `productInStock` differs, if
-     * the product is not indexed yet, or if the indexed document set may have been truncated. The
-     * recomputation mirrors {@link forEachProductVariantDocument}: soft-deleted variants are
-     * excluded and, when the product is disabled, all variants are treated as disabled, so it stays
-     * consistent with {@link createVariantIndexItem}.
+     * Recomputes `inStock` for each moved variant in each channel it is indexed in, and compares it
+     * to the indexed value (see vendurehq/community-plugins#51). Returns `true` on the first
+     * mismatch, and conservatively in every case it cannot judge: no variant ids, a moved variant
+     * that is missing or soft-deleted, a moved variant with no indexed document, an indexed document
+     * for a channel the variant is no longer assigned to, a non-boolean indexed `inStock`, or a
+     * search result that may have been truncated.
+     *
+     * The variant's `enabled` state and its product's `enabled` state are deliberately not consulted:
+     * {@link createVariantIndexItem} writes `inStock` from {@link computeVariantInStock} regardless
+     * of either, so comparing against that same value cannot produce a false mismatch or a false skip.
      */
-    private async productStockStatusDiffersFromIndex(
+    private async movedVariantsStockStatusDiffersFromIndex(
         ctx: MutableRequestContext,
-        productId: ID,
+        variantIds: ID[],
     ): Promise<boolean> {
+        if (variantIds.length === 0) {
+            // Nothing to reason about; behave like 'always'.
+            return true;
+        }
+        // One query for the moved variants. getSaleableStockLevel reads trackInventory,
+        // outOfStockThreshold and useGlobalOutOfStockThreshold (plain columns) and loads stock levels
+        // and global settings itself; `channels` gives us the Channel entities to evaluate under.
+        // Soft-deleted rows are loaded on purpose so we can detect them below.
+        const movedVariants = await this.connection.getRepository(ctx, ProductVariant).find({
+            where: { id: In(variantIds) },
+            relations: ['channels'],
+        });
+        if (movedVariants.length !== variantIds.length || movedVariants.some(v => v.deletedAt != null)) {
+            // Missing or soft-deleted: the index update path decides what the document should be.
+            return true;
+        }
         const result = await this.adapter.search({
             index: this.options.indexPrefix + VARIANT_INDEX_NAME,
             body: {
-                query: { term: { productId } },
-                _source: ['channelId', 'productVariantId', 'inStock', 'productInStock'],
+                // productVariantId is a keyword, so this matches every channel and language document
+                // of the moved variants and nothing else.
+                query: { terms: { productVariantId: variantIds } },
+                _source: ['productVariantId', 'channelId', 'inStock'],
                 size: INDEX_MAX_RESULT_WINDOW,
             },
         });
         const hits = (result.body.hits?.hits ?? []) as Array<{ _source: any }>;
-        if (hits.length === 0) {
-            // Not indexed yet; enqueue so the document gets created.
-            return true;
-        }
         if (hits.length >= INDEX_MAX_RESULT_WINDOW) {
-            // The read may have been truncated at the result window, so we cannot be sure we saw
-            // every indexed document. Enqueue rather than risk skipping a real change.
+            // The read may have been truncated at the result window (variants x channels x languages
+            // reached it), so we cannot be sure we saw every document. Enqueue rather than guess.
             return true;
         }
-        const product = await this.connection.getRepository(ctx, Product).findOne({
-            where: { id: productId, deletedAt: IsNull() },
-            relations: ['channels', 'variants', 'variants.channels'],
-        });
-        if (!product) {
-            return true;
-        }
-        // Mirror the builder: drop soft-deleted variants, and when the product is disabled treat
-        // every variant as disabled (which is what determines productInStock).
-        const liveVariants = product.variants.filter(v => v.deletedAt == null);
-        if (!product.enabled) {
-            liveVariants.forEach(v => (v.enabled = false));
-        }
-        const indexedByChannel = new Map<
-            string,
-            Array<{ variantId: string; inStock: boolean; productInStock: boolean }>
-        >();
+        // Indexed inStock values per (variant, channel). There is one document per language, so a
+        // pair can carry several values; all of them must match.
+        const indexedByVariantChannel = new Map<string, Map<string, unknown[]>>();
         for (const hit of hits) {
-            const key = String(hit._source.channelId);
-            const bucket = indexedByChannel.get(key) ?? [];
-            bucket.push({
-                variantId: String(hit._source.productVariantId),
-                inStock: !!hit._source.inStock,
-                productInStock: !!hit._source.productInStock,
-            });
-            indexedByChannel.set(key, bucket);
+            const variantKey = String(hit._source.productVariantId);
+            const channelKey = String(hit._source.channelId);
+            const byChannel = indexedByVariantChannel.get(variantKey) ?? new Map<string, unknown[]>();
+            const values = byChannel.get(channelKey) ?? [];
+            values.push(hit._source.inStock);
+            byChannel.set(channelKey, values);
+            indexedByVariantChannel.set(variantKey, byChannel);
         }
         const originalChannel = ctx.channel;
         try {
-            for (const channel of product.channels) {
-                const channelDocs = indexedByChannel.get(String(channel.id));
-                if (!channelDocs) {
-                    continue;
+            for (const variant of movedVariants) {
+                const byChannel = indexedByVariantChannel.get(String(variant.id));
+                if (!byChannel) {
+                    // Not indexed yet (or not in any indexed channel); enqueue so the update path
+                    // can create or settle its documents.
+                    return true;
                 }
-                ctx.setChannel(channel);
-                const variantsInChannel = liveVariants.filter(v =>
-                    v.channels.map(c => c.id).includes(channel.id),
-                );
-                const currentInStockByVariant = new Map<string, boolean>();
-                for (const variant of variantsInChannel) {
-                    currentInStockByVariant.set(String(variant.id), await this.computeVariantInStock(ctx, variant));
-                }
-                const currentProductInStock = await this.getProductInStockValue(ctx, variantsInChannel);
-                for (const doc of channelDocs) {
-                    if (currentProductInStock !== doc.productInStock) {
+                for (const [channelKey, indexedValues] of byChannel) {
+                    const channel = variant.channels.find(c => String(c.id) === channelKey);
+                    if (!channel) {
+                        // Indexed for a channel the variant is no longer in; cannot evaluate there.
                         return true;
                     }
-                    const currentInStock = currentInStockByVariant.get(doc.variantId);
-                    if (currentInStock !== undefined && currentInStock !== doc.inStock) {
+                    ctx.setChannel(channel);
+                    const currentInStock = await this.computeVariantInStock(ctx, variant);
+                    if (indexedValues.some(value => value !== currentInStock)) {
                         return true;
                     }
                 }
