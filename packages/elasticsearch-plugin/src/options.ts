@@ -67,6 +67,15 @@ export interface ElasticsearchOptions {
      * not. This avoids the queue write, the poll wait and the worker cycle for stock changes that
      * cannot affect search results (for example a 50 to 49 change that leaves the item in stock).
      *
+     * The check is scoped to the variants whose stock moved: it loads them in one query, reads their
+     * indexed `inStock` values in one search, and recomputes the saleable stock level once per moved
+     * variant per channel. A product's `productInStock` can only flip when one of its variants'
+     * `inStock` flips, so when no moved variant flips, the job is skipped. Because sibling variants
+     * are not recomputed, the check does not notice a `productInStock` that is already stale in the
+     * index for an unrelated reason; repairing a stale index is left to a reindex or the next
+     * non-stock update. When the check cannot decide (for example the variant is not indexed yet),
+     * it enqueues.
+     *
      * This check reads only the built-in stock booleans, so it is applied only when neither
      * `customProductMappings` nor `customProductVariantMappings` are configured. When either is set,
      * a custom field could derive from stock levels and change without an `inStock` flip, so the

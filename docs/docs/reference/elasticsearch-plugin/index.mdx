@@ -176,6 +176,15 @@ product's `productInStock`, and skips the job when it would not, avoiding the
 queue write, the poll wait and the worker cycle for a change that cannot affect
 search results (for example a 50 to 49 change that leaves the item in stock).
 
+The check is scoped to the variants whose stock moved: one query loads them, one
+search reads their indexed `inStock` values, and the saleable stock level is
+recomputed once per moved variant per channel. A product's `productInStock` can
+only flip when one of its variants' `inStock` flips, so if no moved variant flips
+the job is skipped. Sibling variants are not recomputed, so the check does not
+notice a `productInStock` that is already stale in the index for an unrelated
+reason; a reindex or the next non-stock update repairs that. When the check cannot
+decide (for example the variant is not indexed yet) it enqueues.
+
 The check inspects only the built-in stock booleans, so it applies only when
 neither `customProductMappings` nor `customProductVariantMappings` is configured.
 When either is set, a custom field could derive from stock and change without an
