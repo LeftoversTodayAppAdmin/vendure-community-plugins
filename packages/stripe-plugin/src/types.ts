@@ -47,12 +47,15 @@ export interface StripePluginOptions {
      * `'manual'` uses Stripe's separate authorization and capture flow. Confirming the payment only
      * places a hold on the funds (PaymentIntent status `requires_capture`). The plugin then adds an
      * `Authorized` payment to the order so Vendure can allocate stock, and captures the funds only
-     * once the order safely reaches `PaymentAuthorized`. If the order cannot be arranged (for example
-     * the item sold out during checkout), the authorization is voided instead of charged, so the
-     * customer is never charged for an order that cannot be fulfilled.
+     * once that payment is committed and the order safely reaches `PaymentAuthorized`. The capture
+     * happens outside the database transaction, and the `payment_intent.succeeded` webhook settles
+     * any payment that is still `Authorized` after a successful capture. If the order cannot be
+     * arranged (for example the item sold out during checkout) or the authorization does not cover
+     * the order total, the authorization is voided instead of charged, so the customer is never
+     * charged for an order that cannot be fulfilled.
      *
-     * Manual capture requires the `payment_intent.amount_capturable_updated` webhook event to be
-     * enabled, and only applies to payment methods that support authorize-then-capture (cards and
+     * Manual capture requires the `payment_intent.amount_capturable_updated` and
+     * `payment_intent.canceled` webhook events to be enabled, and only applies to payment methods that support authorize-then-capture (cards and
      * several others). See the plugin README for details.
      *
      * @default 'automatic'

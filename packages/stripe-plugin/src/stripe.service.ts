@@ -166,13 +166,13 @@ export class StripeService {
      * webhook controller once the authorized payment has been committed, and by the payment
      * handler's `settlePayment` for captures started from the Admin UI.
      *
-     * The request carries a key derived from the PaymentIntent, so a repeated capture of the same
-     * intent (a redelivered webhook, or a retry after a lost response) is answered with the first
-     * result instead of acting twice.
+     * No idempotency key of our own is sent. Stripe returns the first response for a key for 24
+     * hours, errors included, so a fixed key would hand a failed capture back to every retry. The
+     * SDK still adds its own key to its internal network retries.
      *
-     * Safe to call again: if the intent can no longer be captured (typically because an earlier
-     * attempt already captured it and only the response was lost), its live state is returned so the
-     * caller can decide from the status.
+     * Safe to call again: a repeated capture is refused with `payment_intent_unexpected_state`
+     * (typically because an earlier attempt already captured it and only the response was lost), and
+     * the intent's live state is then returned so the caller can decide from the status.
      */
     async capturePaymentIntent(
         ctx: RequestContext,
@@ -182,10 +182,7 @@ export class StripeService {
         const stripe = await this.getStripeClient(ctx, order);
         const requestOptions = await this.resolveRequestOptions(ctx, order);
         try {
-            return await stripe.paymentIntents.capture(paymentIntentId, undefined, {
-                ...(requestOptions ?? {}),
-                idempotencyKey: `${paymentIntentId}_capture`,
-            });
+            return await stripe.paymentIntents.capture(paymentIntentId, undefined, requestOptions);
         } catch (e) {
             if (isUnexpectedIntentStateError(e)) {
                 return stripe.paymentIntents.retrieve(paymentIntentId, undefined, requestOptions);

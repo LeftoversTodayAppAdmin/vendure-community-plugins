@@ -71,6 +71,23 @@ function mockStripeServerError(method: 'get' | 'post', requestPath: string) {
         .reply(500, { error: { type: 'api_error', message: 'Stripe is having a bad day' } });
 }
 
+/**
+ * Stripe refuses to capture an intent that is captured already, and the plugin then reads its live
+ * state.
+ */
+function mockAlreadyCaptured(id: string) {
+    nock(STRIPE_BASE_URL)
+        .post(`/v1/payment_intents/${id}/capture`)
+        .reply(400, {
+            error: {
+                type: 'invalid_request_error',
+                code: 'payment_intent_unexpected_state',
+                message: 'This PaymentIntent could not be captured because it has a status of succeeded.',
+            },
+        });
+    mockLiveIntent(id, 'succeeded');
+}
+
 function amountCapturableUpdatedEvent(order: FragmentOf<typeof testOrderFragment>, paymentIntentId: string) {
     return {
         id: `evt_${paymentIntentId}`,
@@ -110,6 +127,23 @@ function succeededEvent(order: FragmentOf<typeof testOrderFragment>, paymentInte
                 amount_capturable: 0,
                 amount_received: order.totalWithTax,
                 status: 'succeeded',
+            },
+        },
+    };
+}
+
+function canceledEvent(order: FragmentOf<typeof testOrderFragment>, paymentIntentId: string) {
+    const event = amountCapturableUpdatedEvent(order, paymentIntentId);
+    return {
+        ...event,
+        id: `evt_canceled_${paymentIntentId}`,
+        type: 'payment_intent.canceled',
+        data: {
+            object: {
+                ...event.data.object,
+                amount_capturable: 0,
+                status: 'canceled',
+                cancellation_reason: 'automatic',
             },
         },
     };
@@ -393,6 +427,34 @@ describe('Stripe manual capture', () => {
             expect(voided.state).not.toEqual('PaymentSettled');
             expect(voided.payments?.some(p => p.state === 'Settled')).not.toBe(true);
         });
+
+        it('voids an authorization that no longer covers the order, without recording or capturing it', async () => {
+            // The intent was created for this total...
+            const staleOrder = await prepareOrder(0, 'T_1');
+            // ...then the cart changed, and the customer confirmed the old client secret.
+            const { addItemToOrder } = await shopClient.query(addItemToOrderDocument, {
+                productVariantId: 'T_1',
+                quantity: 1,
+            });
+            orderGuard.assertSuccess(addItemToOrder);
+            const { activeOrder } = await shopClient.query(getActiveOrderDocument);
+            expect(activeOrder!.totalWithTax).toBeGreaterThan(staleOrder.totalWithTax);
+
+            mockLiveIntent('pi_stale', 'requires_capture');
+            const cancelScope = nock(STRIPE_BASE_URL)
+                .post('/v1/payment_intents/pi_stale/cancel')
+                .reply(200, { id: 'pi_stale', status: 'canceled' });
+            // No capture is mocked, so a capture attempt would fail the request.
+
+            const status = await postWebhook(serverPort, amountCapturableUpdatedEvent(staleOrder, 'pi_stale'));
+            expect(status).toEqual(200);
+            expect(cancelScope.isDone()).toBe(true);
+            // The payment was rolled back with the hold, so the order is not left with a payment for
+            // an intent that no longer exists, and it never reached PaymentAuthorized.
+            const afterVoid = await adminOrder(staleOrder.id);
+            expect(afterVoid.state).not.toEqual('PaymentAuthorized');
+            expect(afterVoid.payments ?? []).toHaveLength(0);
+        });
     });
 
     describe('capture outside the transaction', () => {
@@ -411,11 +473,9 @@ describe('Stripe manual capture', () => {
 
             mockLiveIntent('pi_after_commit', 'requires_capture');
             let seenDuringCapture: Awaited<ReturnType<typeof adminOrder>> | undefined;
-            let captureKey: string | undefined;
             nock(STRIPE_BASE_URL)
                 .post('/v1/payment_intents/pi_after_commit/capture')
                 .reply(function (_uri, _body, cb) {
-                    captureKey = this.req.headers['idempotency-key'];
                     // Read through the Admin API, i.e. on another connection: this only sees the
                     // payment if the transaction that recorded it has already been committed.
                     adminOrder(order.id)
@@ -430,7 +490,6 @@ describe('Stripe manual capture', () => {
             expect(status).toEqual(200);
             expect(seenDuringCapture?.state).toEqual('PaymentAuthorized');
             expect(seenDuringCapture?.payments?.map(p => p.state)).toEqual(['Authorized']);
-            expect(captureKey).toEqual('pi_after_commit_capture');
             const settled = await adminOrder(order.id);
             expect(settled.state).toEqual('PaymentSettled');
             expect(settled.payments?.map(p => p.state)).toEqual(['Settled']);
@@ -503,10 +562,9 @@ describe('Stripe manual capture', () => {
                 );
                 expect(status).toBeGreaterThanOrEqual(500);
 
-                // Stripe answers the repeated capture (same idempotency key) with the first result.
-                nock(STRIPE_BASE_URL)
-                    .post('/v1/payment_intents/pi_crash_redelivery/capture')
-                    .reply(200, { id: 'pi_crash_redelivery', status: 'succeeded' });
+                // The funds are captured already, so Stripe refuses the repeated capture and the plugin
+                // settles from the intent's live state.
+                mockAlreadyCaptured('pi_crash_redelivery');
                 const redeliveryStatus = await postWebhook(
                     serverPort,
                     amountCapturableUpdatedEvent(order, 'pi_crash_redelivery'),
@@ -643,6 +701,43 @@ describe('Stripe manual capture', () => {
         });
     });
 
+    describe('payment_intent.canceled', () => {
+        it('cancels a payment whose authorization expired before it was captured, without calling Stripe', async () => {
+            const order = await prepareOrder(0, 'T_1');
+
+            // Leave the payment `Authorized`: the capture is refused, so the funds stay held.
+            mockLiveIntent('pi_expired', 'requires_capture');
+            nock(STRIPE_BASE_URL)
+                .post('/v1/payment_intents/pi_expired/capture')
+                .reply(400, {
+                    error: {
+                        type: 'invalid_request_error',
+                        code: 'amount_too_large',
+                        message: 'Amount must be no more than the amount authorized.',
+                    },
+                });
+            expect(await postWebhook(serverPort, amountCapturableUpdatedEvent(order, 'pi_expired'))).toEqual(200);
+            expect((await adminOrder(order.id)).payments?.map(p => p.state)).toEqual(['Authorized']);
+
+            // Stripe cancels the uncaptured authorization. Nothing is mocked, so any Stripe call (for
+            // example the payment handler trying to void it again) fails the request.
+            const event = canceledEvent(order, 'pi_expired');
+            expect(await postWebhook(serverPort, event)).toEqual(200);
+            const afterExpiry = await adminOrder(order.id);
+            expect(afterExpiry.payments?.map(p => p.state)).toEqual(['Cancelled']);
+
+            // A redelivery finds the payment cancelled already and does nothing.
+            expect(await postWebhook(serverPort, event)).toEqual(200);
+            expect((await adminOrder(order.id)).payments?.map(p => p.state)).toEqual(['Cancelled']);
+        });
+
+        it('acknowledges the event for an intent the plugin voided itself, which has no payment', async () => {
+            const order = await prepareOrder(2, 'T_1');
+            expect(await postWebhook(serverPort, canceledEvent(order, 'pi_voided_by_plugin'))).toEqual(200);
+            expect((await adminOrder(order.id)).payments ?? []).toHaveLength(0);
+        });
+    });
+
     describe('webhook resilience', () => {
         it('returns 5xx on an unexpected error so Stripe redelivers the event', async () => {
             // An order that cannot be found is an unexpected/transient condition (for example
@@ -662,7 +757,14 @@ describe('Stripe manual capture', () => {
             const order = await prepareOrder(2, 'T_1');
 
             mockLiveIntent('pi_transient', 'requires_capture');
-            mockStripeServerError('post', '/v1/payment_intents/pi_transient/capture');
+            const failedKeys: string[] = [];
+            nock(STRIPE_BASE_URL)
+                .post('/v1/payment_intents/pi_transient/capture')
+                .times(3)
+                .reply(function () {
+                    failedKeys.push(this.req.headers['idempotency-key']);
+                    return [500, { error: { type: 'api_error', message: 'Stripe is having a bad day' } }];
+                });
             const status = await postWebhook(serverPort, amountCapturableUpdatedEvent(order, 'pi_transient'));
             // 5xx so Stripe redelivers. The authorization was committed before Stripe was called, so
             // the payment is still `Authorized` and recoverable rather than stuck in `Error`.
@@ -671,15 +773,24 @@ describe('Stripe manual capture', () => {
             expect(afterFailure.state).toEqual('PaymentAuthorized');
             expect(afterFailure.payments?.map(p => p.state)).toEqual(['Authorized']);
 
-            // The redelivery finds the authorized payment, captures and settles the order.
+            // The redelivery finds the authorized payment, captures and settles the order. Stripe
+            // returns the stored response for a reused idempotency key for 24 hours, 500s included,
+            // so the retry only reaches Stripe if it carries a new key.
+            let retryKey: string | undefined;
             nock(STRIPE_BASE_URL)
                 .post('/v1/payment_intents/pi_transient/capture')
-                .reply(200, { id: 'pi_transient', status: 'succeeded' });
+                .reply(function () {
+                    retryKey = this.req.headers['idempotency-key'];
+                    return [200, { id: 'pi_transient', status: 'succeeded' }];
+                });
             const redeliveryStatus = await postWebhook(
                 serverPort,
                 amountCapturableUpdatedEvent(order, 'pi_transient'),
             );
             expect(redeliveryStatus).toEqual(200);
+            expect(failedKeys).toHaveLength(3);
+            expect(failedKeys).not.toContain(retryKey);
+            expect(failedKeys.some(key => key?.includes('pi_transient'))).toBe(false);
             const settled = await adminOrder(order.id);
             expect(settled.state).toEqual('PaymentSettled');
             expect(settled.payments?.map(p => p.state)).toEqual(['Settled']);
@@ -718,22 +829,18 @@ describe('Stripe manual capture', () => {
         it('records one payment and settles it once when the same event is delivered twice at the same time', async () => {
             const order = await prepareOrder(5, 'T_1');
 
-            // Mock enough for both deliveries to capture. The order lock makes the second delivery
-            // wait until the first has recorded the payment, so it finds an `Authorized` payment and
-            // resumes the capture. Both captures carry the same idempotency key, so Stripe answers the
-            // second with the first result, and only one payment is recorded and settled.
-            const captureKeys: string[] = [];
+            // The order lock makes the second delivery wait until the first has recorded the payment,
+            // so it finds an `Authorized` payment and resumes the capture. Stripe refuses that second
+            // capture because the funds are captured already, and only one payment is recorded and
+            // settled.
             nock(STRIPE_BASE_URL)
                 .get('/v1/payment_intents/pi_concurrent')
                 .times(2)
                 .reply(200, { id: 'pi_concurrent', status: 'requires_capture' });
             nock(STRIPE_BASE_URL)
                 .post('/v1/payment_intents/pi_concurrent/capture')
-                .times(2)
-                .reply(function () {
-                    captureKeys.push(this.req.headers['idempotency-key']);
-                    return [200, { id: 'pi_concurrent', status: 'succeeded' }];
-                });
+                .reply(200, { id: 'pi_concurrent', status: 'succeeded' });
+            mockAlreadyCaptured('pi_concurrent');
 
             const event = amountCapturableUpdatedEvent(order, 'pi_concurrent');
             const statuses = await Promise.all([postWebhook(serverPort, event), postWebhook(serverPort, event)]);
@@ -743,7 +850,6 @@ describe('Stripe manual capture', () => {
             // 5xx, which is also safe because Stripe would redeliver it.
             expect(statuses.some(s => s === 200)).toBe(true);
             expect(statuses.every(s => s === 200 || s >= 500)).toBe(true);
-            expect(new Set(captureKeys)).toEqual(new Set(['pi_concurrent_capture']));
             const settled = await adminOrder(order.id);
             expect(settled.state).toEqual('PaymentSettled');
             expect(settled.payments?.filter(p => p.transactionId === 'pi_concurrent')).toHaveLength(1);

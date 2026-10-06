@@ -9,6 +9,7 @@ import {
     Logger,
     Order,
     OrderService,
+    orderTotalIsCovered,
     Payment,
     PaymentMethodService,
     RequestContextService,
@@ -28,6 +29,11 @@ const missingHeaderErrorMessage = 'Missing stripe-signature header';
 const signatureErrorMessage = 'Error verifying Stripe webhook signature';
 const noPaymentIntentErrorMessage = 'No payment intent in the event payload';
 const ignorePaymentIntentEvent = 'Event has no Vendure metadata, skipped.';
+
+/**
+ * Thrown inside the webhook transaction to roll back a payment whose authorization will be voided.
+ */
+class AuthorizationNotUsableError extends Error {}
 
 @Controller('payments')
 export class StripeController {
@@ -165,10 +171,18 @@ export class StripeController {
                     }
                     return;
                 }
-                // In manual-capture mode `canceled` fires after the plugin voids the authorization, so
-                // it merely confirms an action already taken here.
+                // In manual-capture mode `canceled` fires when the authorization is voided, either by
+                // the plugin or the Admin UI (the payment is then already gone or `Cancelled`) or by
+                // Stripe when the authorization expires before it was captured. In the last case the
+                // payment is still `Authorized`, so cancel it here.
                 if (isManualCapture && event.type === 'payment_intent.canceled') {
-                    Logger.info(`Authorization voided for order ${orderCode} (${paymentIntent.id})`, loggerCtx);
+                    const cancelled = await this.cancelVoidedPayment(ctx, orderCode, paymentIntent.id);
+                    if (!cancelled) {
+                        Logger.info(
+                            `Authorization voided for order ${orderCode} (${paymentIntent.id}), no payment to cancel`,
+                            loggerCtx,
+                        );
+                    }
                     return;
                 }
 
@@ -187,7 +201,15 @@ export class StripeController {
                 if (existingPayment) {
                     if (isManualCapture && existingPayment.state === 'Authorized') {
                         // An earlier delivery recorded the authorization but did not get to capture
-                        // it (a temporary Stripe error, or the process stopped), so pick up from there.
+                        // it (a temporary Stripe error, or the process stopped), so pick up from there,
+                        // unless the order has moved on since (for example it was cancelled).
+                        if (!(await this.isReadyForCapture(ctx, order))) {
+                            Logger.error(
+                                `Payment for intent ${paymentIntent.id} is authorized but order ${orderCode} is '${order.state}', not capturing`,
+                                loggerCtx,
+                            );
+                            return;
+                        }
                         Logger.info(
                             `Payment for intent ${paymentIntent.id} is still authorized, resuming capture for order ${orderCode}`,
                             loggerCtx,
@@ -302,6 +324,19 @@ export class StripeController {
                     return;
                 }
 
+                if (isManualCapture && !(await this.isReadyForCapture(ctx, addPaymentToOrderResult))) {
+                    // The payment does not cover the order total, typically because the cart changed
+                    // after the intent was created and the customer confirmed the old client secret.
+                    // Vendure leaves such an order in ArrangingPayment without allocating stock, so the
+                    // funds must not be captured. Roll back the payment and void the hold instead.
+                    Logger.error(
+                        `Authorization ${paymentIntent.id} does not cover order ${orderCode} (state '${addPaymentToOrderResult.state}'), voiding it`,
+                        loggerCtx,
+                    );
+                    shouldVoidAuthorization = true;
+                    throw new AuthorizationNotUsableError();
+                }
+
                 // The payment intent ID is added to the order only if we can reach this point.
                 Logger.info(
                     `Stripe payment intent id ${paymentIntent.id} added to order ${orderCode}`,
@@ -315,19 +350,22 @@ export class StripeController {
                 }
             });
         } catch (e: any) {
-            // An unexpected/transient error (for example a database issue) rolled back the
-            // transaction. Respond with a 5xx so Stripe redelivers the event and we get another
-            // chance to process it; the idempotency guard above makes redelivery safe. We do not void
-            // here on purpose: a transient failure must not discard a valid authorization. Genuine
-            // "cannot arrange the order" outcomes are handled deterministically above (they void and
-            // return 200), so they are not retried.
-            Logger.error(
-                `Error processing Stripe webhook for order ${orderCode}: ${(e as Error)?.message}`,
-                loggerCtx,
-            );
-            if (!response.headersSent) {
-                response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('Error processing webhook');
+            if (!(e instanceof AuthorizationNotUsableError)) {
+                // An unexpected/transient error (for example a database issue) rolled back the
+                // transaction. Respond with a 5xx so Stripe redelivers the event and we get another
+                // chance to process it; the idempotency guard above makes redelivery safe. We do not
+                // void here on purpose: a transient failure must not discard a valid authorization.
+                // Genuine "cannot arrange the order" outcomes are handled deterministically above
+                // (they void and return 200), so they are not retried.
+                Logger.error(
+                    `Error processing Stripe webhook for order ${orderCode}: ${(e as Error)?.message}`,
+                    loggerCtx,
+                );
+                if (!response.headersSent) {
+                    response.status(HttpStatus.INTERNAL_SERVER_ERROR).send('Error processing webhook');
+                }
             }
+            // Otherwise the payment was rolled back on purpose and the hold is voided below.
         }
 
         if (orderToCapture && !response.headersSent) {
@@ -466,6 +504,60 @@ export class StripeController {
             return false;
         }
         Logger.info(`Settled payment ${paymentIntentId} for order ${orderCode}`, loggerCtx);
+        return true;
+    }
+
+    /**
+     * Whether the funds held for an order's `Authorized` payment may be captured. Vendure moves the
+     * order to `PaymentAuthorized`, allocating stock, only once its payments cover the total. An
+     * additional payment for a modified order leaves it in `ArrangingAdditionalPayment`, so there
+     * the payments are checked directly.
+     */
+    private async isReadyForCapture(ctx: RequestContext, order: Order): Promise<boolean> {
+        if (order.state === 'PaymentAuthorized') {
+            return true;
+        }
+        if (order.state !== 'ArrangingAdditionalPayment') {
+            return false;
+        }
+        order.payments = await this.orderService.getOrderPayments(ctx, order.id);
+        return orderTotalIsCovered(order, ['Authorized', 'Settled']);
+    }
+
+    /**
+     * Cancels the payment for a PaymentIntent that Stripe has cancelled, but only if it is still
+     * `Authorized`. Returns whether a payment was cancelled. Must run in a transaction that already
+     * holds the order lock; it makes no Stripe calls.
+     */
+    private async cancelVoidedPayment(
+        ctx: RequestContext,
+        orderCode: string,
+        paymentIntentId: string,
+    ): Promise<boolean> {
+        const paymentRepository = this.connection.getRepository(ctx, Payment);
+        const payment = await paymentRepository.findOne({ where: { transactionId: paymentIntentId } });
+        if (!payment || payment.state !== 'Authorized') {
+            return false;
+        }
+        // Tells the payment handler that the intent is cancelled already, so cancelling doesn't call
+        // Stripe from inside this transaction.
+        payment.metadata = { ...payment.metadata, paymentIntentCanceled: true };
+        await paymentRepository.save(payment, { reload: false });
+        const cancelResult = await this.orderService.cancelPayment(ctx, payment.id);
+        if (isGraphQlErrorResult(cancelResult)) {
+            Logger.error(
+                `Stripe cancelled payment ${paymentIntentId} for order ${orderCode} but it could not be cancelled in Vendure: ${cancelResult.message}`,
+                loggerCtx,
+            );
+            return false;
+        }
+        // Cancelling the payment does not release the order's stock; that happens when the order is
+        // cancelled, which is left to the merchant (they may prefer to collect a new payment).
+        Logger.warn(
+            `Authorization ${paymentIntentId} for order ${orderCode} was cancelled in Stripe before it was captured, ` +
+                `payment cancelled. Cancel the order to release its stock, or collect a new payment.`,
+            loggerCtx,
+        );
         return true;
     }
 

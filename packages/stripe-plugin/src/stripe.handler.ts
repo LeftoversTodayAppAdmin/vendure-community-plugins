@@ -116,6 +116,11 @@ export const stripePaymentMethodHandler = new PaymentMethodHandler({
             // behaviour of cancelling the Vendure payment without calling Stripe.
             return { success: true };
         }
+        // The webhook controller cancels the payment after Stripe has already cancelled the intent (for
+        // example an authorization that expired before capture), so there is nothing left to void.
+        if (payment.metadata?.paymentIntentCanceled === true) {
+            return { success: true };
+        }
         // Manual capture: void the authorization so the held funds are released without a charge.
         try {
             const cancelled = await stripeService.cancelPaymentIntent(ctx, order, payment.transactionId);
