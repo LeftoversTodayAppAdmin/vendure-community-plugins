@@ -1698,7 +1698,6 @@ describe(`Elasticsearch plugin [${searchBackend as string}]`, () => {
             });
         });
     });
-
 });
 
 export const searchProductsAdminDocument = graphql(`
