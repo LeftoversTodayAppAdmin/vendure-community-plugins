@@ -73,7 +73,7 @@ lives on the inner factory, so swapping backends only touches the
 factory call and none of the shared plugin options below.
 ### reindexOnStockMovement
 
-<MemberInfo kind="property" type={`'always' | 'onStockStatusChange'`} default={`'always'`}  since="2.2.0"  />
+<MemberInfo kind="property" type={`'always' | 'onStockStatusChange'`} default={`'always'`}  since="2.1.0"  />
 
 Controls whether a stock change enqueues a search index update job. This covers both a
 `StockMovementEvent` (an order-driven sale or allocation) and a `ProductVariantEvent` whose
@@ -104,7 +104,7 @@ It is a pre-enqueue optimisation only, complementary to
 `ElasticsearchOptions.incrementalIndexUpdates`, which governs the write itself.
 ### incrementalIndexUpdates
 
-<MemberInfo kind="property" type={`boolean`} default={`false`}  since="2.2.0"  />
+<MemberInfo kind="property" type={`boolean`} default={`false`}  since="2.1.0"  />
 
 Opt-in. When `true`, an incremental product update reads the product's currently indexed
 documents, compares them field-for-field against the freshly built documents, and writes only

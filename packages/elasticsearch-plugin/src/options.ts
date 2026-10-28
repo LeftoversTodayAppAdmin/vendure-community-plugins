@@ -86,7 +86,7 @@ export interface ElasticsearchOptions {
      * {@link ElasticsearchOptions.incrementalIndexUpdates}, which governs the write itself.
      *
      * @default 'always'
-     * @since 2.2.0
+     * @since 2.1.0
      */
     reindexOnStockMovement?: 'always' | 'onStockStatusChange';
     /**
@@ -104,7 +104,7 @@ export interface ElasticsearchOptions {
      * When `false` (the default) the historic delete-then-recreate behaviour is used unchanged.
      *
      * @default false
-     * @since 2.2.0
+     * @since 2.1.0
      */
     incrementalIndexUpdates?: boolean;
     /**
